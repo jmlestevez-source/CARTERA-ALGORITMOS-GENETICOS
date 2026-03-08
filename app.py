@@ -65,6 +65,8 @@ st.markdown("""
 # ============================================
 SYSTEMS = ['CEG', 'DGSE', 'DDG', 'EIR', 'Colossus']
 DATA_FILE = 'portfolio_data.json'
+RESERVE_LIQUIDITY = 500  # Liquidez mínima reservada en EUR
+DEFAULT_COMMISSION_USD = 2.0  # Comisión por defecto en USD
 
 # ============================================
 # FUNCIONES DE DATOS
@@ -193,6 +195,10 @@ def get_session_state():
         st.session_state.exchange_rate = get_exchange_rate()
     return st.session_state.data
 
+def get_effective_capital(data: dict) -> float:
+    """Devuelve el capital efectivo (capital total - reserva de liquidez)"""
+    return data['settings']['capital'] - RESERVE_LIQUIDITY
+
 # ============================================
 # FUNCIONES DE CÁLCULO
 # ============================================
@@ -210,6 +216,7 @@ def calculate_positions(data: dict) -> dict:
             positions[ticker] = {
                 'units': 0,
                 'total_cost': 0,
+                'total_commission': 0,
                 'avg_price': 0,
                 'current_price': 0,
                 'market_value': 0,
@@ -219,9 +226,11 @@ def calculate_positions(data: dict) -> dict:
             }
         
         pos = positions[ticker]
+        commission = order.get('commission', 0)
         
         if order['type'] == 'BUY':
-            pos['total_cost'] += order['total']
+            pos['total_cost'] += order['total'] + commission
+            pos['total_commission'] += commission
             pos['units'] += order['units']
             if order.get('system'):
                 for s in order['system'].split(', '):
@@ -232,6 +241,7 @@ def calculate_positions(data: dict) -> dict:
                 ratio = order['units'] / pos['units']
                 pos['total_cost'] -= pos['total_cost'] * ratio
                 pos['units'] -= order['units']
+                pos['total_commission'] += commission
     
     # Calcular valores actuales
     for ticker, pos in list(positions.items()):
@@ -263,11 +273,11 @@ def calculate_allocation(data: dict, month: int, year: int) -> dict:
     """Calcula asignación basada en señales"""
     key = f"{year}-{month}"
     signals = data['signals'].get(key, {})
-    capital = data['settings']['capital']
+    effective_capital = get_effective_capital(data)  # Usar capital efectivo
     exchange_rate = st.session_state.get('exchange_rate', 1.08)
     
     allocation = {}
-    cap_per_system = capital / len(SYSTEMS)
+    cap_per_system = effective_capital / len(SYSTEMS)
     
     for system in SYSTEMS:
         sys_signals = signals.get(system, {'buy': [], 'hold': [], 'sell': []})
@@ -311,22 +321,29 @@ def calculate_allocation(data: dict, month: int, year: int) -> dict:
     for ticker, item in allocation.items():
         if item['price_eur'] > 0:
             item['total_units'] = int(item['total_capital'] / item['price_eur'])
-        item['weight'] = (item['total_capital'] / capital * 100)
+        item['weight'] = (item['total_capital'] / effective_capital * 100)
     
     return allocation
 
 def calculate_stats(data: dict, positions: dict) -> dict:
     """Calcula estadísticas del portfolio"""
     capital = data['settings']['capital']
+    effective_capital = get_effective_capital(data)
     
     total_value = 0
     total_invested = 0
+    total_commissions = 0
     
     for pos in positions.values():
         total_value += pos['market_value']
         total_invested += pos['total_cost']
+        total_commissions += pos.get('total_commission', 0)
+    
+    # Calcular comisiones totales de todas las órdenes
+    total_commissions = sum(o.get('commission', 0) for o in data['orders'])
     
     cash = max(0, capital - total_invested)
+    available_cash = max(0, cash - RESERVE_LIQUIDITY)  # Liquidez disponible (sin reserva)
     pnl = total_value - total_invested
     pnl_pct = (pnl / total_invested * 100) if total_invested > 0 else 0
     
@@ -334,9 +351,13 @@ def calculate_stats(data: dict, positions: dict) -> dict:
         'total_value': total_value + cash,
         'total_invested': total_invested,
         'cash': cash,
+        'available_cash': available_cash,
+        'reserve': RESERVE_LIQUIDITY,
+        'total_commissions': total_commissions,
         'pnl': pnl,
         'pnl_pct': pnl_pct,
-        'num_positions': len(positions)
+        'num_positions': len(positions),
+        'effective_capital': effective_capital
     }
 
 # ============================================
@@ -348,7 +369,7 @@ def render_metric_card(title: str, value: str, delta: str = None, delta_color: s
 
 def render_header():
     """Renderiza el header de la aplicación"""
-    col1, col2, col3 = st.columns([2, 1, 1])
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
     
     with col1:
         st.markdown('<p class="main-header">🧬 Cartera Algoritmos Genéticos</p>', unsafe_allow_html=True)
@@ -360,7 +381,12 @@ def render_header():
     
     with col3:
         data = get_session_state()
-        st.metric("Capital", f"{data['settings']['capital']:,.0f} €")
+        st.metric("Capital Total", f"{data['settings']['capital']:,.0f} €")
+    
+    with col4:
+        data = get_session_state()
+        effective = get_effective_capital(data)
+        st.metric("Capital Efectivo", f"{effective:,.0f} €", f"-{RESERVE_LIQUIDITY}€ reserva")
 
 # ============================================
 # PÁGINAS
@@ -372,7 +398,7 @@ def page_dashboard():
     stats = calculate_stats(data, positions)
     
     # Métricas principales
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
         st.metric(
@@ -393,16 +419,23 @@ def page_dashboard():
     
     with col3:
         st.metric(
-            "💵 Liquidez",
-            f"{stats['cash']:,.2f} €",
-            f"{(stats['cash']/data['settings']['capital']*100):.1f}% del capital"
+            "💵 Liquidez Disponible",
+            f"{stats['available_cash']:,.2f} €",
+            f"Reserva: {RESERVE_LIQUIDITY}€"
         )
     
     with col4:
         st.metric(
+            "💸 Comisiones Totales",
+            f"{stats['total_commissions']:,.2f} €",
+            f"{len(data['orders'])} órdenes"
+        )
+    
+    with col5:
+        st.metric(
             "📦 Posiciones",
             stats['num_positions'],
-            f"{len(data['orders'])} órdenes"
+            f"Cap. efectivo: {stats['effective_capital']:,.0f}€"
         )
     
     # Gráficos
@@ -452,7 +485,7 @@ def page_dashboard():
             # Añadir capital no invertido
             for sys in SYSTEMS:
                 if system_values[sys] == 0:
-                    system_values[sys] = data['settings']['capital'] / len(SYSTEMS)
+                    system_values[sys] = get_effective_capital(data) / len(SYSTEMS)
             
             fig = px.pie(
                 values=list(system_values.values()),
@@ -624,6 +657,7 @@ def page_signals():
 def page_allocation():
     """Página de asignación calculada"""
     data = get_session_state()
+    effective_capital = get_effective_capital(data)
     
     st.subheader("📊 Asignación Calculada")
     
@@ -644,10 +678,10 @@ def page_allocation():
         year = st.selectbox("Año", range(2024, 2031), index=datetime.now().year - 2024, key="alloc_year")
     
     with col3:
-        st.metric("Capital", f"{data['settings']['capital']:,.0f} €")
+        st.metric("Capital Efectivo", f"{effective_capital:,.0f} €", f"Reserva: {RESERVE_LIQUIDITY}€")
     
     with col4:
-        st.metric("Por Sistema", f"{data['settings']['capital']/5:,.0f} €")
+        st.metric("Por Sistema", f"{effective_capital/5:,.0f} €")
     
     # Calcular asignación
     allocation = calculate_allocation(data, month, year)
@@ -694,6 +728,10 @@ def page_allocation():
                 
                 with col5:
                     if st.button("Comprar", key=f"buy_alloc_{ticker}"):
+                        # Calcular comisión por defecto en EUR
+                        exchange_rate = st.session_state.get('exchange_rate', 1.08)
+                        commission_eur = DEFAULT_COMMISSION_USD / exchange_rate
+                        
                         order = {
                             'id': int(datetime.now().timestamp() * 1000),
                             'date': datetime.now().strftime('%Y-%m-%d'),
@@ -702,11 +740,12 @@ def page_allocation():
                             'units': item['total_units'],
                             'price': round(item['price_eur'], 2),
                             'total': round(item['total_units'] * item['price_eur'], 2),
+                            'commission': round(commission_eur, 2),
                             'system': ', '.join(item['systems'])
                         }
                         data['orders'].insert(0, order)
                         save_data(data)
-                        st.success(f"✅ Compra de {item['total_units']} {ticker} registrada")
+                        st.success(f"✅ Compra de {item['total_units']} {ticker} registrada (comisión: {commission_eur:.2f}€)")
                         st.rerun()
     else:
         st.info("No hay señales cargadas para este mes. Ve a la pestaña 'Señales' para añadirlas.")
@@ -714,6 +753,7 @@ def page_allocation():
 def page_orders():
     """Página de registro de órdenes"""
     data = get_session_state()
+    exchange_rate = st.session_state.get('exchange_rate', 1.08)
     
     st.subheader("📝 Registro de Órdenes")
     
@@ -733,6 +773,7 @@ def page_orders():
         selected_ticker = None
         selected_price = 0.0
         order_date_str = order_date.strftime('%Y-%m-%d')
+        date_exchange_rate = exchange_rate
         
         if search:
             results = search_ticker(search)
@@ -768,7 +809,7 @@ def page_orders():
                         
                         st.info(f"💰 Precio apertura {order_date_str}: {quote['price']:.2f} {quote['currency']} = {price:.2f} € | EUR/USD: {date_exchange_rate:.4f}")
         
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         
         with col1:
             units = st.number_input("Unidades", min_value=1, value=1)
@@ -777,10 +818,30 @@ def page_orders():
             price = st.number_input("Precio (€)", min_value=0.01, value=selected_price if selected_price > 0 else 100.0, format="%.2f")
         
         with col3:
+            # Comisión por defecto: 2 USD convertidos a EUR
+            default_commission_eur = DEFAULT_COMMISSION_USD / date_exchange_rate
+            commission = st.number_input(
+                f"Comisión (€)", 
+                min_value=0.0, 
+                value=round(default_commission_eur, 2), 
+                format="%.2f",
+                help=f"Por defecto: {DEFAULT_COMMISSION_USD} USD = {default_commission_eur:.2f} EUR"
+            )
+        
+        with col4:
             system = st.selectbox("Sistema (opcional)", [""] + SYSTEMS)
         
-        total = units * price
-        st.metric("Total", f"{total:,.2f} €")
+        # Resumen de la orden
+        subtotal = units * price
+        total = subtotal + commission
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Subtotal", f"{subtotal:,.2f} €")
+        with col2:
+            st.metric("Comisión", f"{commission:,.2f} €")
+        with col3:
+            st.metric("Total", f"{total:,.2f} €")
         
         if st.button("✅ Registrar Orden", type="primary", disabled=not selected_ticker):
             order = {
@@ -790,20 +851,22 @@ def page_orders():
                 'ticker': selected_ticker,
                 'units': units,
                 'price': round(price, 2),
-                'total': round(total, 2),
+                'total': round(subtotal, 2),
+                'commission': round(commission, 2),
                 'system': system
             }
             data['orders'].insert(0, order)
             save_data(data)
-            st.success(f"✅ Orden de {order_type} registrada: {units} {selected_ticker} @ {price:.2f} €")
+            st.success(f"✅ Orden de {order_type} registrada: {units} {selected_ticker} @ {price:.2f} € + {commission:.2f}€ comisión")
             st.rerun()
     
     # Resumen
     st.markdown("---")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     
     total_bought = sum(o['total'] for o in data['orders'] if o['type'] == 'BUY')
     total_sold = sum(o['total'] for o in data['orders'] if o['type'] == 'SELL')
+    total_commissions = sum(o.get('commission', 0) for o in data['orders'])
     
     with col1:
         st.metric("🟢 Total Comprado", f"{total_bought:,.2f} €")
@@ -811,50 +874,47 @@ def page_orders():
         st.metric("🔴 Total Vendido", f"{total_sold:,.2f} €")
     with col3:
         st.metric("📊 Neto Invertido", f"{total_bought - total_sold:,.2f} €")
+    with col4:
+        st.metric("💸 Total Comisiones", f"{total_commissions:,.2f} €")
     
     # Tabla de órdenes
     st.markdown("---")
     st.subheader("📋 Historial de Órdenes")
     
     if data['orders']:
-        orders_df = []
-        for i, order in enumerate(data['orders']):
-            orders_df.append({
-                'Fecha': order['date'],
-                'Tipo': '🟢 COMPRA' if order['type'] == 'BUY' else '🔴 VENTA',
-                'Ticker': order['ticker'],
-                'Unidades': order['units'],
-                'Precio': f"{order['price']:.2f} €",
-                'Total': f"{order['total']:.2f} €",
-                'Sistema': order.get('system', '-'),
-                'ID': i
-            })
+        # Crear lista de órdenes para mostrar
+        orders_to_delete = None
         
-        df = pd.DataFrame(orders_df)
-        
-        # Mostrar tabla con opción de eliminar
-        for i, row in df.iterrows():
-            col1, col2, col3, col4, col5, col6, col7, col8 = st.columns([1.2, 1, 1, 0.8, 1, 1, 1, 0.5])
+        for idx, order in enumerate(data['orders']):
+            col1, col2, col3, col4, col5, col6, col7, col8, col9 = st.columns([1.1, 0.9, 1, 0.7, 0.9, 0.9, 0.7, 0.9, 0.4])
             
             with col1:
-                st.write(row['Fecha'])
+                st.write(order['date'])
             with col2:
-                st.write(row['Tipo'])
+                tipo = '🟢 COMPRA' if order['type'] == 'BUY' else '🔴 VENTA'
+                st.write(tipo)
             with col3:
-                st.write(row['Ticker'])
+                st.write(order['ticker'])
             with col4:
-                st.write(row['Unidades'])
+                st.write(order['units'])
             with col5:
-                st.write(row['Precio'])
+                st.write(f"{order['price']:.2f} €")
             with col6:
-                st.write(row['Total'])
+                st.write(f"{order['total']:.2f} €")
             with col7:
-                st.write(row['Sistema'])
+                comm = order.get('commission', 0)
+                st.write(f"{comm:.2f} €")
             with col8:
-                if st.button("🗑️", key=f"del_order_{row['ID']}"):
-                    data['orders'].pop(row['ID'])
-                    save_data(data)
-                    st.rerun()
+                st.write(order.get('system', '-') or '-')
+            with col9:
+                if st.button("🗑️", key=f"del_order_{idx}_{order['id']}"):
+                    orders_to_delete = idx
+        
+        # Eliminar orden si se marcó
+        if orders_to_delete is not None:
+            data['orders'].pop(orders_to_delete)
+            save_data(data)
+            st.rerun()
     else:
         st.info("No hay órdenes registradas.")
 
@@ -928,11 +988,15 @@ def page_portfolio():
             
             st.warning(f"📤 Vender {ticker}")
             
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
             with col1:
                 sell_units = st.number_input("Unidades a vender", min_value=1, max_value=pos['units'], value=pos['units'])
             with col2:
                 sell_price = st.number_input("Precio (€)", min_value=0.01, value=pos['current_price'], format="%.2f")
+            with col3:
+                exchange_rate = st.session_state.get('exchange_rate', 1.08)
+                default_commission_eur = DEFAULT_COMMISSION_USD / exchange_rate
+                sell_commission = st.number_input("Comisión (€)", min_value=0.0, value=round(default_commission_eur, 2), format="%.2f")
             
             col1, col2 = st.columns(2)
             with col1:
@@ -945,6 +1009,7 @@ def page_portfolio():
                         'units': sell_units,
                         'price': round(sell_price, 2),
                         'total': round(sell_units * sell_price, 2),
+                        'commission': round(sell_commission, 2),
                         'system': ''
                     }
                     data['orders'].insert(0, order)
@@ -1045,7 +1110,12 @@ def page_etfs():
     st.markdown("### 📋 ETFs Guardados")
     
     if data['etfs']:
-        for ticker, etf in data['etfs'].items():
+        # Crear lista de tickers para poder eliminar sin errores
+        tickers_list = list(data['etfs'].keys())
+        etf_to_delete = None
+        
+        for ticker in tickers_list:
+            etf = data['etfs'][ticker]
             col1, col2, col3, col4, col5, col6 = st.columns([1.5, 3, 1, 1.2, 1, 0.5])
             
             with col1:
@@ -1069,10 +1139,14 @@ def page_etfs():
                 st.write(f"{color} {change:+.2f}%")
             
             with col6:
-                if st.button("🗑️", key=f"del_etf_{ticker}"):
-                    del data['etfs'][ticker]
-                    save_data(data)
-                    st.rerun()
+                if st.button("🗑️", key=f"delete_etf_{ticker}"):
+                    etf_to_delete = ticker
+        
+        # Eliminar ETF si se marcó
+        if etf_to_delete is not None:
+            del data['etfs'][etf_to_delete]
+            save_data(data)
+            st.rerun()
     else:
         st.info("No hay ETFs guardados. Usa el buscador para añadir.")
 
@@ -1082,18 +1156,33 @@ def page_settings():
     
     st.subheader("⚙️ Configuración")
     
-    # Capital
-    new_capital = st.number_input(
-        "Capital Total (€)",
-        min_value=1000,
-        value=data['settings']['capital'],
-        step=1000
-    )
+    # Capital y liquidez
+    col1, col2 = st.columns(2)
     
-    if new_capital != data['settings']['capital']:
-        data['settings']['capital'] = new_capital
-        save_data(data)
-        st.success("✅ Capital actualizado")
+    with col1:
+        new_capital = st.number_input(
+            "Capital Total (€)",
+            min_value=1000,
+            value=data['settings']['capital'],
+            step=1000
+        )
+        
+        if new_capital != data['settings']['capital']:
+            data['settings']['capital'] = new_capital
+            save_data(data)
+            st.success("✅ Capital actualizado")
+    
+    with col2:
+        st.metric("Reserva de Liquidez", f"{RESERVE_LIQUIDITY} €")
+        st.metric("Capital Efectivo", f"{new_capital - RESERVE_LIQUIDITY:,.0f} €")
+    
+    st.info(f"ℹ️ Se reservan siempre {RESERVE_LIQUIDITY}€ de liquidez para evitar problemas de ejecución. Los cálculos de asignación se realizan sobre el capital efectivo ({new_capital - RESERVE_LIQUIDITY:,.0f}€).")
+    
+    st.markdown("---")
+    
+    # Comisión por defecto
+    st.subheader("💸 Comisión por Defecto")
+    st.info(f"La comisión por defecto es de **{DEFAULT_COMMISSION_USD} USD** por orden, que se convierte automáticamente a EUR según el tipo de cambio del día de la orden.")
     
     st.markdown("---")
     
