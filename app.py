@@ -32,12 +32,6 @@ st.markdown("""
         -webkit-text-fill-color: transparent;
         margin-bottom: 0;
     }
-    .metric-card {
-        background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
-        border-radius: 1rem;
-        padding: 1.5rem;
-        border: 1px solid #334155;
-    }
     .positive { color: #10b981; }
     .negative { color: #ef4444; }
     .stTabs [data-baseweb="tab-list"] {
@@ -68,7 +62,6 @@ SYSTEMS = ['CEG', 'DGSE', 'DDG', 'EIR', 'Colossus']
 DATA_FILE = 'portfolio_data.json'
 DEFAULT_COMMISSION_USD = 2.0
 
-# Benchmarks predefinidos
 BENCHMARKS = {
     'SPY': 'S&P 500 (USD)',
     'IWDA.L': 'MSCI World (EUR)',
@@ -84,7 +77,6 @@ BENCHMARKS = {
 # ============================================
 @st.cache_data(ttl=300)
 def search_ticker(query: str) -> list:
-    """Busca tickers en Yahoo Finance"""
     if len(query) < 1:
         return []
     try:
@@ -104,27 +96,25 @@ def search_ticker(query: str) -> list:
                 })
         return results
     except Exception as e:
-        st.error(f"Error buscando: {e}")
         return []
 
 @st.cache_data(ttl=60)
 def get_quote(symbol: str, date: str = None) -> dict:
-    """Obtiene cotización de Yahoo Finance para una fecha específica o actual"""
     try:
         ticker = yf.Ticker(symbol)
         info = ticker.info
         
         if date:
             start_date = datetime.strptime(date, '%Y-%m-%d')
-            end_date = start_date + timedelta(days=1)
+            end_date = start_date + timedelta(days=5)
             hist = ticker.history(start=start_date, end=end_date)
             
             if hist.empty:
                 hist = ticker.history(period="5d", end=end_date)
             
             if not hist.empty:
-                current_price = hist['Open'].iloc[-1]
-                prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
+                current_price = hist['Open'].iloc[0]
+                prev_close = hist['Close'].iloc[0] if len(hist) > 0 else current_price
             else:
                 return None
         else:
@@ -150,7 +140,6 @@ def get_quote(symbol: str, date: str = None) -> dict:
 
 @st.cache_data(ttl=300)
 def get_historical_prices(symbol: str, start_date: str, end_date: str = None) -> pd.DataFrame:
-    """Obtiene precios históricos de un ticker"""
     try:
         ticker = yf.Ticker(symbol)
         if end_date:
@@ -162,25 +151,24 @@ def get_historical_prices(symbol: str, start_date: str, end_date: str = None) ->
             hist.index = hist.index.tz_localize(None)
             return hist[['Open', 'High', 'Low', 'Close', 'Volume']]
         return pd.DataFrame()
-    except Exception as e:
+    except:
         return pd.DataFrame()
 
 @st.cache_data(ttl=300)
 def get_exchange_rate(date: str = None) -> float:
-    """Obtiene tipo de cambio EUR/USD para una fecha específica o actual"""
     try:
         ticker = yf.Ticker("EURUSD=X")
         
         if date:
             start_date = datetime.strptime(date, '%Y-%m-%d')
-            end_date = start_date + timedelta(days=1)
+            end_date = start_date + timedelta(days=5)
             hist = ticker.history(start=start_date, end=end_date)
             
             if hist.empty:
                 hist = ticker.history(period="5d", end=end_date)
             
             if not hist.empty:
-                return hist['Open'].iloc[-1]
+                return hist['Open'].iloc[0]
         else:
             hist = ticker.history(period="1d")
             if not hist.empty:
@@ -191,7 +179,6 @@ def get_exchange_rate(date: str = None) -> float:
 
 @st.cache_data(ttl=300)
 def get_exchange_rate_history(start_date: str) -> pd.DataFrame:
-    """Obtiene histórico del tipo de cambio EUR/USD"""
     try:
         ticker = yf.Ticker("EURUSD=X")
         hist = ticker.history(start=start_date)
@@ -203,7 +190,6 @@ def get_exchange_rate_history(start_date: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 def load_data() -> dict:
-    """Carga datos desde archivo JSON"""
     default_data = {
         'settings': {
             'capital': 15000,
@@ -212,7 +198,9 @@ def load_data() -> dict:
         },
         'etfs': {},
         'signals': {},
+        'allocations': {},
         'orders': [],
+        'contributions': [],
         'snapshots': []
     }
     
@@ -220,22 +208,25 @@ def load_data() -> dict:
         try:
             with open(DATA_FILE, 'r') as f:
                 loaded_data = json.load(f)
+                # Migración de datos antiguos
                 if 'reserve' not in loaded_data.get('settings', {}):
                     loaded_data['settings']['reserve'] = 500
                 if 'benchmark' not in loaded_data.get('settings', {}):
                     loaded_data['settings']['benchmark'] = 'SPY'
+                if 'allocations' not in loaded_data:
+                    loaded_data['allocations'] = {}
+                if 'contributions' not in loaded_data:
+                    loaded_data['contributions'] = []
                 return loaded_data
         except:
             pass
     return default_data
 
 def save_data(data: dict):
-    """Guarda datos en archivo JSON"""
     with open(DATA_FILE, 'w') as f:
         json.dump(data, f, indent=2, default=str)
 
 def get_session_state():
-    """Inicializa y devuelve el estado de la sesión"""
     if 'data' not in st.session_state:
         st.session_state.data = load_data()
     if 'exchange_rate' not in st.session_state:
@@ -243,19 +234,22 @@ def get_session_state():
     return st.session_state.data
 
 def get_effective_capital(data: dict) -> float:
-    """Devuelve el capital efectivo (capital total - reserva de liquidez)"""
     reserve = data['settings'].get('reserve', 500)
     return data['settings']['capital'] - reserve
 
 def get_reserve(data: dict) -> float:
-    """Devuelve la reserva de liquidez"""
     return data['settings'].get('reserve', 500)
 
+def get_total_capital_with_contributions(data: dict) -> float:
+    """Calcula el capital total incluyendo aportaciones"""
+    base_capital = data['settings']['capital']
+    total_contributions = sum(c['amount'] for c in data.get('contributions', []))
+    return base_capital + total_contributions
+
 # ============================================
-# FUNCIONES DE CÁLCULO DE PORTFOLIO
+# FUNCIONES DE CÁLCULO
 # ============================================
 def calculate_positions(data: dict) -> dict:
-    """Calcula posiciones actuales basadas en órdenes"""
     positions = {}
     exchange_rate = st.session_state.get('exchange_rate', 1.08)
     
@@ -319,22 +313,19 @@ def calculate_positions(data: dict) -> dict:
     return positions
 
 def calculate_portfolio_history(data: dict) -> pd.DataFrame:
-    """Calcula el histórico del valor del portfolio basado en órdenes"""
+    """Calcula el histórico del valor del portfolio basado en órdenes y aportaciones"""
     if not data['orders']:
         return pd.DataFrame()
     
-    # Ordenar órdenes por fecha
     sorted_orders = sorted(data['orders'], key=lambda x: x['date'])
-    first_order_date = sorted_orders[0]['date']
+    sorted_contributions = sorted(data.get('contributions', []), key=lambda x: x['date'])
     
-    # Obtener rango de fechas
+    first_order_date = sorted_orders[0]['date']
     start_date = datetime.strptime(first_order_date, '%Y-%m-%d')
     end_date = datetime.now()
     
-    # Crear rango de fechas de trading (días laborables)
     date_range = pd.date_range(start=start_date, end=end_date, freq='B')
     
-    # Obtener histórico de precios de todos los tickers en las órdenes
     tickers = list(set([o['ticker'] for o in data['orders']]))
     
     price_data = {}
@@ -349,23 +340,24 @@ def calculate_portfolio_history(data: dict) -> pd.DataFrame:
         if not hist.empty:
             price_data[ticker] = hist['Close']
     
-    # Obtener histórico EUR/USD
     eurusd_hist = get_exchange_rate_history(first_order_date)
     
-    # Calcular valor del portfolio para cada día
+    base_capital = data['settings']['capital']
     portfolio_values = []
-    cash_values = []
-    invested_values = []
-    
-    capital = data['settings']['capital']
     
     for date in date_range:
         date_str = date.strftime('%Y-%m-%d')
         
+        # Calcular capital total hasta esta fecha (base + aportaciones)
+        contributions_to_date = sum(
+            c['amount'] for c in sorted_contributions 
+            if c['date'] <= date_str
+        )
+        total_capital = base_capital + contributions_to_date
+        
         # Calcular posiciones a esta fecha
         positions_at_date = {}
         total_invested = 0
-        total_commissions = 0
         
         for order in sorted_orders:
             if order['date'] > date_str:
@@ -376,7 +368,6 @@ def calculate_portfolio_history(data: dict) -> pd.DataFrame:
                 positions_at_date[ticker] = {'units': 0, 'cost': 0}
             
             commission = order.get('commission', 0)
-            total_commissions += commission
             
             if order['type'] == 'BUY':
                 positions_at_date[ticker]['units'] += order['units']
@@ -385,7 +376,8 @@ def calculate_portfolio_history(data: dict) -> pd.DataFrame:
             else:
                 if positions_at_date[ticker]['units'] > 0:
                     ratio = order['units'] / positions_at_date[ticker]['units']
-                    positions_at_date[ticker]['cost'] -= positions_at_date[ticker]['cost'] * ratio
+                    cost_sold = positions_at_date[ticker]['cost'] * ratio
+                    positions_at_date[ticker]['cost'] -= cost_sold
                     positions_at_date[ticker]['units'] -= order['units']
                     total_invested -= order['total']
         
@@ -396,7 +388,6 @@ def calculate_portfolio_history(data: dict) -> pd.DataFrame:
                 continue
             
             if ticker in price_data:
-                # Buscar precio más cercano
                 prices = price_data[ticker]
                 valid_prices = prices[prices.index <= date]
                 
@@ -404,7 +395,6 @@ def calculate_portfolio_history(data: dict) -> pd.DataFrame:
                     price = valid_prices.iloc[-1]
                     currency = currency_data.get(ticker, 'EUR')
                     
-                    # Convertir a EUR si es necesario
                     if currency == 'USD' and not eurusd_hist.empty:
                         valid_rates = eurusd_hist[eurusd_hist.index <= date]
                         if not valid_rates.empty:
@@ -415,7 +405,7 @@ def calculate_portfolio_history(data: dict) -> pd.DataFrame:
                     
                     market_value += pos['units'] * price
         
-        cash = max(0, capital - total_invested)
+        cash = max(0, total_capital - total_invested)
         total_value = market_value + cash
         
         portfolio_values.append({
@@ -423,7 +413,9 @@ def calculate_portfolio_history(data: dict) -> pd.DataFrame:
             'total_value': total_value,
             'market_value': market_value,
             'cash': cash,
-            'invested': total_invested
+            'invested': total_invested,
+            'total_capital': total_capital,
+            'contributions': contributions_to_date
         })
     
     if not portfolio_values:
@@ -435,20 +427,17 @@ def calculate_portfolio_history(data: dict) -> pd.DataFrame:
     return df
 
 def calculate_benchmark_history(benchmark: str, start_date: str) -> pd.DataFrame:
-    """Obtiene el histórico del benchmark normalizado"""
     hist = get_historical_prices(benchmark, start_date)
     
     if hist.empty:
         return pd.DataFrame()
     
-    # Determinar moneda del benchmark
     try:
         ticker = yf.Ticker(benchmark)
         currency = ticker.info.get('currency', 'USD')
     except:
         currency = 'USD'
     
-    # Convertir a EUR si es necesario
     if currency == 'USD':
         eurusd_hist = get_exchange_rate_history(start_date)
         if not eurusd_hist.empty:
@@ -460,53 +449,47 @@ def calculate_benchmark_history(benchmark: str, start_date: str) -> pd.DataFrame
     return hist[['Close']]
 
 def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = None, capital: float = 15000) -> dict:
-    """Calcula métricas de rendimiento del portfolio"""
     if portfolio_df.empty:
         return {}
     
-    # Calcular retornos diarios
     portfolio_df = portfolio_df.copy()
+    
+    # Calcular retornos ajustados por aportaciones (TWR - Time Weighted Return)
+    portfolio_df['capital_change'] = portfolio_df['total_capital'].diff().fillna(0)
+    portfolio_df['adjusted_value'] = portfolio_df['total_value'] - portfolio_df['capital_change'].cumsum()
     portfolio_df['returns'] = portfolio_df['total_value'].pct_change()
     
-    # Eliminar NaN
     returns = portfolio_df['returns'].dropna()
     
     if len(returns) < 2:
         return {
-            'total_return': 0,
-            'total_return_pct': 0,
-            'cagr': 0,
-            'volatility': 0,
-            'sharpe': 0,
-            'sortino': 0,
-            'max_drawdown': 0,
-            'current_drawdown': 0,
-            'best_day': 0,
-            'worst_day': 0,
-            'win_rate': 0,
-            'profit_factor': 0
+            'total_return': 0, 'total_return_pct': 0, 'cagr': 0,
+            'volatility': 0, 'sharpe': 0, 'sortino': 0,
+            'max_drawdown': 0, 'current_drawdown': 0,
+            'best_day': 0, 'worst_day': 0, 'win_rate': 0, 'profit_factor': 0
         }
     
-    # Valores iniciales y finales
     initial_value = portfolio_df['total_value'].iloc[0]
     final_value = portfolio_df['total_value'].iloc[-1]
+    total_contributions = portfolio_df['contributions'].iloc[-1] - portfolio_df['contributions'].iloc[0]
     
-    # Retorno total
-    total_return = final_value - initial_value
-    total_return_pct = ((final_value / initial_value) - 1) * 100
+    # Retorno total ajustado por aportaciones
+    total_return = final_value - initial_value - total_contributions
+    initial_capital = portfolio_df['total_capital'].iloc[0]
+    total_return_pct = (total_return / initial_capital) * 100 if initial_capital > 0 else 0
     
     # CAGR
     days = (portfolio_df.index[-1] - portfolio_df.index[0]).days
     years = days / 365.25
     if years > 0 and initial_value > 0:
-        cagr = ((final_value / initial_value) ** (1 / years) - 1) * 100
+        # TWR CAGR
+        cumulative_return = (1 + returns).prod()
+        cagr = (cumulative_return ** (1 / years) - 1) * 100
     else:
         cagr = 0
     
-    # Volatilidad anualizada
     volatility = returns.std() * np.sqrt(252) * 100
     
-    # Ratio Sharpe (asumiendo risk-free rate = 2%)
     risk_free_rate = 0.02
     excess_returns = returns - (risk_free_rate / 252)
     if returns.std() > 0:
@@ -514,30 +497,25 @@ def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = N
     else:
         sharpe = 0
     
-    # Ratio Sortino (solo volatilidad negativa)
     negative_returns = returns[returns < 0]
     if len(negative_returns) > 0 and negative_returns.std() > 0:
         sortino = (excess_returns.mean() / negative_returns.std()) * np.sqrt(252)
     else:
         sortino = 0
     
-    # Drawdown
     portfolio_df['peak'] = portfolio_df['total_value'].cummax()
     portfolio_df['drawdown'] = (portfolio_df['total_value'] - portfolio_df['peak']) / portfolio_df['peak'] * 100
     
     max_drawdown = portfolio_df['drawdown'].min()
     current_drawdown = portfolio_df['drawdown'].iloc[-1]
     
-    # Mejor y peor día
     best_day = returns.max() * 100
     worst_day = returns.min() * 100
     
-    # Win rate
     winning_days = (returns > 0).sum()
     total_days = len(returns)
     win_rate = (winning_days / total_days) * 100 if total_days > 0 else 0
     
-    # Profit factor
     gains = returns[returns > 0].sum()
     losses = abs(returns[returns < 0].sum())
     profit_factor = gains / losses if losses > 0 else 0
@@ -556,12 +534,11 @@ def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = N
         'win_rate': win_rate,
         'profit_factor': profit_factor,
         'peak': portfolio_df['peak'].iloc[-1],
-        'days': days
+        'days': days,
+        'total_contributions': total_contributions
     }
     
-    # Métricas del benchmark si está disponible
     if benchmark_df is not None and not benchmark_df.empty:
-        # Alinear fechas
         aligned = portfolio_df.join(benchmark_df, how='inner', rsuffix='_bench')
         
         if len(aligned) > 1:
@@ -570,10 +547,8 @@ def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = N
             
             bench_returns = aligned['Close'].pct_change().dropna()
             
-            # Retorno benchmark
             metrics['bench_return_pct'] = ((bench_final / bench_initial) - 1) * 100
             
-            # CAGR benchmark
             bench_days = (aligned.index[-1] - aligned.index[0]).days
             bench_years = bench_days / 365.25
             if bench_years > 0:
@@ -581,19 +556,14 @@ def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = N
             else:
                 metrics['bench_cagr'] = 0
             
-            # Volatilidad benchmark
             metrics['bench_volatility'] = bench_returns.std() * np.sqrt(252) * 100
             
-            # Drawdown benchmark
             aligned['bench_peak'] = aligned['Close'].cummax()
             aligned['bench_drawdown'] = (aligned['Close'] - aligned['bench_peak']) / aligned['bench_peak'] * 100
             metrics['bench_max_drawdown'] = aligned['bench_drawdown'].min()
             
-            # Alpha y Beta
             if len(bench_returns) > 0 and bench_returns.std() > 0:
                 port_returns = aligned['total_value'].pct_change().dropna()
-                
-                # Alinear retornos
                 common_idx = port_returns.index.intersection(bench_returns.index)
                 if len(common_idx) > 1:
                     port_ret = port_returns.loc[common_idx]
@@ -617,10 +587,12 @@ def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = N
     
     return metrics
 
-def calculate_allocation(data: dict, month: int, year: int) -> dict:
-    """Calcula asignación basada en señales"""
+def calculate_and_save_allocation(data: dict, month: int, year: int) -> dict:
+    """Calcula y guarda la asignación fija para un mes"""
     key = f"{year}-{month}"
     signals = data['signals'].get(key, {})
+    
+    # Usar el capital efectivo del momento en que se guardan las señales
     effective_capital = get_effective_capital(data)
     exchange_rate = st.session_state.get('exchange_rate', 1.08)
     
@@ -669,24 +641,92 @@ def calculate_allocation(data: dict, month: int, year: int) -> dict:
             item['total_units'] = int(item['total_capital'] / item['price_eur'])
         item['weight'] = (item['total_capital'] / effective_capital * 100)
     
+    # Guardar la asignación fija
+    data['allocations'][key] = {
+        'allocation': allocation,
+        'effective_capital': effective_capital,
+        'exchange_rate': exchange_rate,
+        'created_at': datetime.now().isoformat()
+    }
+    
+    return allocation
+
+def get_allocation(data: dict, month: int, year: int) -> dict:
+    """Obtiene la asignación guardada o la calcula si no existe"""
+    key = f"{year}-{month}"
+    
+    if key in data['allocations']:
+        return data['allocations'][key]['allocation']
+    
+    # Si no existe, calcular (pero no guardar automáticamente)
+    return calculate_allocation_dynamic(data, month, year)
+
+def calculate_allocation_dynamic(data: dict, month: int, year: int) -> dict:
+    """Calcula la asignación dinámicamente (sin guardar)"""
+    key = f"{year}-{month}"
+    signals = data['signals'].get(key, {})
+    effective_capital = get_effective_capital(data)
+    exchange_rate = st.session_state.get('exchange_rate', 1.08)
+    
+    allocation = {}
+    cap_per_system = effective_capital / len(SYSTEMS)
+    
+    for system in SYSTEMS:
+        sys_signals = signals.get(system, {'buy': [], 'hold': [], 'sell': []})
+        active_etfs = sys_signals.get('buy', []) + sys_signals.get('hold', [])
+        
+        if not active_etfs:
+            continue
+        
+        cap_per_etf = cap_per_system / len(active_etfs)
+        
+        for ticker in active_etfs:
+            etf_data = data['etfs'].get(ticker, {})
+            price = etf_data.get('price', 0)
+            currency = etf_data.get('currency', 'EUR')
+            
+            price_eur = price
+            if currency == 'USD' and price > 0:
+                price_eur = price / exchange_rate
+            elif currency == 'GBP' and price > 0:
+                price_eur = price * 1.17
+            
+            if ticker not in allocation:
+                allocation[ticker] = {
+                    'systems': [],
+                    'total_capital': 0,
+                    'price': price,
+                    'price_eur': price_eur,
+                    'currency': currency,
+                    'total_units': 0,
+                    'weight': 0,
+                    'name': etf_data.get('name', ticker)
+                }
+            
+            allocation[ticker]['systems'].append(system)
+            allocation[ticker]['total_capital'] += cap_per_etf
+    
+    for ticker, item in allocation.items():
+        if item['price_eur'] > 0:
+            item['total_units'] = int(item['total_capital'] / item['price_eur'])
+        item['weight'] = (item['total_capital'] / effective_capital * 100) if effective_capital > 0 else 0
+    
     return allocation
 
 def calculate_stats(data: dict, positions: dict) -> dict:
-    """Calcula estadísticas del portfolio"""
-    capital = data['settings']['capital']
-    effective_capital = get_effective_capital(data)
+    capital = get_total_capital_with_contributions(data)
+    effective_capital = capital - get_reserve(data)
     reserve = get_reserve(data)
     
     total_value = 0
     total_invested = 0
-    total_commissions = 0
     
     for pos in positions.values():
         total_value += pos['market_value']
         total_invested += pos['total_cost']
-        total_commissions += pos.get('total_commission', 0)
     
     total_commissions = sum(o.get('commission', 0) for o in data['orders'])
+    total_contributions = sum(c['amount'] for c in data.get('contributions', []))
     
     cash = max(0, capital - total_invested)
     available_cash = max(0, cash - reserve)
@@ -700,17 +740,18 @@ def calculate_stats(data: dict, positions: dict) -> dict:
         'available_cash': available_cash,
         'reserve': reserve,
         'total_commissions': total_commissions,
+        'total_contributions': total_contributions,
         'pnl': pnl,
         'pnl_pct': pnl_pct,
         'num_positions': len(positions),
-        'effective_capital': effective_capital
+        'effective_capital': effective_capital,
+        'total_capital': capital
     }
 
 # ============================================
 # COMPONENTES UI
 # ============================================
 def render_header():
-    """Renderiza el header de la aplicación"""
     col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
     
     with col1:
@@ -723,11 +764,14 @@ def render_header():
     
     with col3:
         data = get_session_state()
-        st.metric("Capital Total", f"{data['settings']['capital']:,.0f} €")
+        total_capital = get_total_capital_with_contributions(data)
+        contributions = sum(c['amount'] for c in data.get('contributions', []))
+        st.metric("Capital Total", f"{total_capital:,.0f} €", 
+                 f"+{contributions:,.0f}€ aportaciones" if contributions > 0 else None)
     
     with col4:
         data = get_session_state()
-        effective = get_effective_capital(data)
+        effective = get_total_capital_with_contributions(data) - get_reserve(data)
         reserve = get_reserve(data)
         st.metric("Capital Efectivo", f"{effective:,.0f} €", f"-{reserve:.0f}€ reserva")
 
@@ -735,7 +779,6 @@ def render_header():
 # PÁGINAS
 # ============================================
 def page_dashboard():
-    """Página principal - Dashboard"""
     data = get_session_state()
     positions = calculate_positions(data)
     stats = calculate_stats(data, positions)
@@ -744,20 +787,19 @@ def page_dashboard():
     col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
+        delta_color = "normal" if stats['pnl'] >= 0 else "inverse"
         st.metric(
             "💰 Valor Total",
             f"{stats['total_value']:,.2f} €",
             f"{stats['pnl_pct']:+.2f}%" if stats['total_invested'] > 0 else None,
-            delta_color="normal" if stats['pnl'] >= 0 else "inverse"
+            delta_color=delta_color
         )
     
     with col2:
-        color = "normal" if stats['pnl'] >= 0 else "inverse"
         st.metric(
             "📊 P&L Total",
             f"{stats['pnl']:+,.2f} €",
-            f"Invertido: {stats['total_invested']:,.0f} €",
-            delta_color=color
+            f"Invertido: {stats['total_invested']:,.0f} €"
         )
     
     with col3:
@@ -769,7 +811,7 @@ def page_dashboard():
     
     with col4:
         st.metric(
-            "💸 Comisiones Totales",
+            "💸 Comisiones",
             f"{stats['total_commissions']:,.2f} €",
             f"{len(data['orders'])} órdenes"
         )
@@ -778,7 +820,7 @@ def page_dashboard():
         st.metric(
             "📦 Posiciones",
             stats['num_positions'],
-            f"Cap. efectivo: {stats['effective_capital']:,.0f}€"
+            f"Aportaciones: {stats['total_contributions']:,.0f}€"
         )
     
     st.markdown("---")
@@ -802,24 +844,21 @@ def page_dashboard():
             data['settings']['benchmark'] = selected_benchmark
             save_data(data)
     
-    # Calcular histórico del portfolio
     portfolio_df = calculate_portfolio_history(data)
     
     if not portfolio_df.empty:
-        # Obtener histórico del benchmark
         first_date = portfolio_df.index[0].strftime('%Y-%m-%d')
         benchmark_df = calculate_benchmark_history(selected_benchmark, first_date)
         
-        # Calcular métricas
-        metrics = calculate_metrics(portfolio_df, benchmark_df, data['settings']['capital'])
+        metrics = calculate_metrics(portfolio_df, benchmark_df, stats['total_capital'])
         
-        # Mostrar métricas en dos filas
         st.subheader("📈 Métricas de Rendimiento")
         
         col1, col2, col3, col4, col5, col6 = st.columns(6)
         
         with col1:
-            st.metric("📈 Retorno Total", f"{metrics.get('total_return_pct', 0):.2f}%",
+            color = "🟢" if metrics.get('total_return_pct', 0) >= 0 else "🔴"
+            st.metric(f"{color} Retorno Total", f"{metrics.get('total_return_pct', 0):.2f}%",
                      f"{metrics.get('total_return', 0):+,.2f}€")
         with col2:
             st.metric("📊 CAGR", f"{metrics.get('cagr', 0):.2f}%")
@@ -847,7 +886,6 @@ def page_dashboard():
         with col6:
             st.metric("📅 Días", f"{metrics.get('days', 0)}")
         
-        # Comparativa con Benchmark
         if 'bench_return_pct' in metrics:
             st.markdown("---")
             st.subheader(f"📊 Comparativa vs {selected_benchmark}")
@@ -856,9 +894,10 @@ def page_dashboard():
             
             with col1:
                 diff = metrics['total_return_pct'] - metrics.get('bench_return_pct', 0)
+                color = "🟢" if diff >= 0 else "🔴"
                 st.metric(f"Retorno {selected_benchmark}", 
                          f"{metrics.get('bench_return_pct', 0):.2f}%",
-                         f"Diferencia: {diff:+.2f}%")
+                         f"{color} Dif: {diff:+.2f}%")
             with col2:
                 st.metric(f"CAGR {selected_benchmark}", f"{metrics.get('bench_cagr', 0):.2f}%")
             with col3:
@@ -876,7 +915,6 @@ def page_dashboard():
         with col1:
             st.subheader("📈 Curva de Equity")
             
-            # Normalizar para comparación (base 100)
             portfolio_df['normalized'] = (portfolio_df['total_value'] / portfolio_df['total_value'].iloc[0]) * 100
             
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
@@ -884,7 +922,6 @@ def page_dashboard():
                                row_heights=[0.7, 0.3],
                                subplot_titles=('Valor Normalizado (Base 100)', 'Drawdown (%)'))
             
-            # Curva del portfolio
             fig.add_trace(
                 go.Scatter(
                     x=portfolio_df.index,
@@ -897,24 +934,23 @@ def page_dashboard():
                 row=1, col=1
             )
             
-            # Curva del benchmark
             if not benchmark_df.empty:
                 benchmark_aligned = benchmark_df.reindex(portfolio_df.index, method='ffill')
-                benchmark_aligned['normalized'] = (benchmark_aligned['Close'] / benchmark_aligned['Close'].iloc[0]) * 100
-                
-                fig.add_trace(
-                    go.Scatter(
-                        x=benchmark_aligned.index,
-                        y=benchmark_aligned['normalized'],
-                        mode='lines',
-                        name=selected_benchmark,
-                        line=dict(color='#f59e0b', width=2, dash='dash'),
-                        hovertemplate='%{x|%d/%m/%Y}<br>' + selected_benchmark + ': %{y:.2f}<extra></extra>'
-                    ),
-                    row=1, col=1
-                )
+                if not benchmark_aligned.empty and 'Close' in benchmark_aligned.columns:
+                    benchmark_aligned['normalized'] = (benchmark_aligned['Close'] / benchmark_aligned['Close'].iloc[0]) * 100
+                    
+                    fig.add_trace(
+                        go.Scatter(
+                            x=benchmark_aligned.index,
+                            y=benchmark_aligned['normalized'],
+                            mode='lines',
+                            name=selected_benchmark,
+                            line=dict(color='#f59e0b', width=2, dash='dash'),
+                            hovertemplate='%{x|%d/%m/%Y}<br>' + selected_benchmark + ': %{y:.2f}<extra></extra>'
+                        ),
+                        row=1, col=1
+                    )
             
-            # Drawdown del portfolio
             portfolio_df['peak'] = portfolio_df['total_value'].cummax()
             portfolio_df['drawdown'] = (portfolio_df['total_value'] - portfolio_df['peak']) / portfolio_df['peak'] * 100
             
@@ -931,23 +967,6 @@ def page_dashboard():
                 ),
                 row=2, col=1
             )
-            
-            # Drawdown del benchmark
-            if not benchmark_df.empty and 'normalized' in benchmark_aligned.columns:
-                benchmark_aligned['peak'] = benchmark_aligned['Close'].cummax()
-                benchmark_aligned['drawdown'] = (benchmark_aligned['Close'] - benchmark_aligned['peak']) / benchmark_aligned['peak'] * 100
-                
-                fig.add_trace(
-                    go.Scatter(
-                        x=benchmark_aligned.index,
-                        y=benchmark_aligned['drawdown'],
-                        mode='lines',
-                        name=f'DD {selected_benchmark}',
-                        line=dict(color='#f59e0b', width=1, dash='dash'),
-                        hovertemplate='%{x|%d/%m/%Y}<br>DD ' + selected_benchmark + ': %{y:.2f}%<extra></extra>'
-                    ),
-                    row=2, col=1
-                )
             
             fig.update_layout(
                 height=500,
@@ -974,7 +993,6 @@ def page_dashboard():
                         if sys in system_values:
                             system_values[sys] += pos['market_value'] / len(pos['systems'])
                 
-                # Filtrar sistemas con valor
                 system_values = {k: v for k, v in system_values.items() if v > 0}
                 
                 if system_values:
@@ -985,7 +1003,7 @@ def page_dashboard():
                         color_discrete_sequence=['#0ea5e9', '#10b981', '#f59e0b', '#8b5cf6', '#ef4444']
                     )
                     fig.update_layout(
-                        height=400,
+                        height=300,
                         plot_bgcolor='rgba(0,0,0,0)',
                         paper_bgcolor='rgba(0,0,0,0)',
                         font_color='#94a3b8',
@@ -996,39 +1014,7 @@ def page_dashboard():
                 else:
                     st.info("No hay posiciones asignadas a sistemas.")
             else:
-                st.info("No hay posiciones para mostrar distribución.")
-            
-            # Distribución por activo
-            st.subheader("📊 Distribución por Activo")
-            if positions:
-                asset_data = []
-                for ticker, pos in positions.items():
-                    asset_data.append({
-                        'Ticker': ticker,
-                        'Valor': pos['market_value'],
-                        'Peso': pos['market_value'] / stats['total_value'] * 100 if stats['total_value'] > 0 else 0
-                    })
-                
-                asset_df = pd.DataFrame(asset_data)
-                asset_df = asset_df.sort_values('Valor', ascending=True)
-                
-                fig = px.bar(
-                    asset_df,
-                    x='Valor',
-                    y='Ticker',
-                    orientation='h',
-                    color='Valor',
-                    color_continuous_scale='Blues'
-                )
-                fig.update_layout(
-                    height=max(200, len(positions) * 40),
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    font_color='#94a3b8',
-                    showlegend=False,
-                    coloraxis_showscale=False
-                )
-                st.plotly_chart(fig, use_container_width=True)
+                st.info("No hay posiciones para mostrar.")
     else:
         st.info("No hay órdenes registradas. Registra órdenes para ver la evolución del portfolio.")
     
@@ -1058,7 +1044,6 @@ def page_dashboard():
         st.info("No hay posiciones en cartera. Registra órdenes para comenzar.")
 
 def page_signals():
-    """Página de gestión de señales"""
     data = get_session_state()
     
     st.subheader("📊 Gestión de Señales Mensuales")
@@ -1080,6 +1065,11 @@ def page_signals():
     key = f"{year}-{month}"
     if key not in data['signals']:
         data['signals'][key] = {sys: {'buy': [], 'hold': [], 'sell': []} for sys in SYSTEMS}
+    
+    # Mostrar si hay asignación guardada
+    if key in data['allocations']:
+        alloc_info = data['allocations'][key]
+        st.success(f"✅ Asignación guardada el {alloc_info.get('created_at', 'N/A')[:10]} con capital efectivo de {alloc_info.get('effective_capital', 0):,.0f}€")
     
     st.markdown("---")
     st.subheader("🔍 Buscar ETF en Yahoo Finance")
@@ -1170,12 +1160,27 @@ def page_signals():
                     
                     st.markdown("---")
     
-    if st.button("💾 Guardar Señales", type="primary", use_container_width=True):
-        save_data(data)
-        st.success("✅ Señales guardadas correctamente")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("💾 Guardar Señales y Calcular Asignación", type="primary", use_container_width=True):
+            # Guardar señales
+            save_data(data)
+            # Calcular y guardar asignación fija
+            calculate_and_save_allocation(data, month, year)
+            save_data(data)
+            st.success("✅ Señales guardadas y asignación calculada")
+            st.rerun()
+    
+    with col2:
+        if key in data['allocations']:
+            if st.button("🔄 Recalcular Asignación", use_container_width=True):
+                calculate_and_save_allocation(data, month, year)
+                save_data(data)
+                st.success("✅ Asignación recalculada")
+                st.rerun()
 
 def page_allocation():
-    """Página de asignación calculada"""
     data = get_session_state()
     effective_capital = get_effective_capital(data)
     reserve = get_reserve(data)
@@ -1197,13 +1202,26 @@ def page_allocation():
     with col2:
         year = st.selectbox("Año", range(2024, 2031), index=datetime.now().year - 2024, key="alloc_year")
     
+    key = f"{year}-{month}"
+    
     with col3:
-        st.metric("Capital Efectivo", f"{effective_capital:,.0f} €", f"Reserva: {reserve:.0f}€")
+        if key in data['allocations']:
+            saved_capital = data['allocations'][key].get('effective_capital', effective_capital)
+            st.metric("Capital (guardado)", f"{saved_capital:,.0f} €", "✅ Fijo")
+        else:
+            st.metric("Capital Efectivo", f"{effective_capital:,.0f} €", f"Reserva: {reserve:.0f}€")
     
     with col4:
-        st.metric("Por Sistema", f"{effective_capital/5:,.0f} €")
+        cap = data['allocations'][key].get('effective_capital', effective_capital) if key in data['allocations'] else effective_capital
+        st.metric("Por Sistema", f"{cap/5:,.0f} €")
     
-    allocation = calculate_allocation(data, month, year)
+    # Obtener asignación (guardada o calculada)
+    allocation = get_allocation(data, month, year)
+    
+    if key in data['allocations']:
+        st.success(f"✅ Asignación FIJA guardada el {data['allocations'][key].get('created_at', '')[:10]}")
+    else:
+        st.warning("⚠️ Asignación no guardada. Ve a 'Señales' y guarda las señales para fijar la asignación.")
     
     if allocation:
         st.markdown("---")
@@ -1262,31 +1280,38 @@ def page_allocation():
                         }
                         data['orders'].insert(0, order)
                         save_data(data)
-                        st.success(f"✅ Compra de {item['total_units']} {ticker} registrada (comisión: {commission_eur:.2f}€)")
+                        st.success(f"✅ Compra de {item['total_units']} {ticker} registrada")
                         st.rerun()
     else:
         st.info("No hay señales cargadas para este mes. Ve a la pestaña 'Señales' para añadirlas.")
 
 def page_orders():
-    """Página de registro de órdenes"""
     data = get_session_state()
     exchange_rate = st.session_state.get('exchange_rate', 1.08)
     
     st.subheader("📝 Registro de Órdenes")
     
-    with st.expander("➕ Nueva Orden", expanded=True):
+    # Verificar si hay una orden siendo editada
+    editing_order = st.session_state.get('editing_order', None)
+    
+    with st.expander("➕ Nueva Orden" if not editing_order else "✏️ Editar Orden", expanded=True):
         col1, col2 = st.columns(2)
         
         with col1:
-            order_type = st.radio("Tipo", ["BUY", "SELL"], horizontal=True)
+            default_type = editing_order['type'] if editing_order else "BUY"
+            order_type = st.radio("Tipo", ["BUY", "SELL"], horizontal=True, 
+                                 index=0 if default_type == "BUY" else 1)
         
         with col2:
-            order_date = st.date_input("Fecha", datetime.now(), key="order_date_input")
+            default_date = datetime.strptime(editing_order['date'], '%Y-%m-%d') if editing_order else datetime.now()
+            order_date = st.date_input("Fecha", default_date, key="order_date_input")
         
-        search = st.text_input("🔍 Buscar ETF/Acción", key="order_search")
+        search = st.text_input("🔍 Buscar ETF/Acción", 
+                              value=editing_order['ticker'] if editing_order else "",
+                              key="order_search")
         
-        selected_ticker = None
-        selected_price = 0.0
+        selected_ticker = editing_order['ticker'] if editing_order else None
+        selected_price = editing_order['price'] if editing_order else 0.0
         order_date_str = order_date.strftime('%Y-%m-%d')
         date_exchange_rate = exchange_rate
         
@@ -1294,52 +1319,64 @@ def page_orders():
             results = search_ticker(search)
             if results:
                 options = [f"{r['symbol']} - {r['name'][:30]}" for r in results[:5]]
-                selected = st.selectbox("Seleccionar", options, key="order_select")
+                default_idx = 0
+                if editing_order:
+                    for i, opt in enumerate(options):
+                        if opt.startswith(editing_order['ticker']):
+                            default_idx = i
+                            break
+                
+                selected = st.selectbox("Seleccionar", options, index=default_idx, key="order_select")
                 if selected:
                     selected_ticker = selected.split(" - ")[0]
                     
-                    with st.spinner("Obteniendo precio..."):
-                        quote = get_quote(selected_ticker, order_date_str)
-                        date_exchange_rate = get_exchange_rate(order_date_str)
-                    
-                    if quote and quote.get('success'):
-                        data['etfs'][selected_ticker] = {
-                            'yahooSymbol': selected_ticker,
-                            'name': quote['name'],
-                            'price': quote['price'],
-                            'currency': quote['currency'],
-                            'change_pct': quote.get('change_pct', 0)
-                        }
+                    if not editing_order or selected_ticker != editing_order['ticker']:
+                        with st.spinner("Obteniendo precio..."):
+                            quote = get_quote(selected_ticker, order_date_str)
+                            date_exchange_rate = get_exchange_rate(order_date_str)
                         
-                        price = quote['price']
-                        if quote['currency'] == 'USD':
-                            price = price / date_exchange_rate
-                        elif quote['currency'] == 'GBP':
-                            price = price * 1.17
-                        selected_price = price
-                        
-                        st.info(f"💰 Precio apertura {order_date_str}: {quote['price']:.2f} {quote['currency']} = {price:.2f} € | EUR/USD: {date_exchange_rate:.4f}")
+                        if quote and quote.get('success'):
+                            data['etfs'][selected_ticker] = {
+                                'yahooSymbol': selected_ticker,
+                                'name': quote['name'],
+                                'price': quote['price'],
+                                'currency': quote['currency'],
+                                'change_pct': quote.get('change_pct', 0)
+                            }
+                            
+                            price = quote['price']
+                            if quote['currency'] == 'USD':
+                                price = price / date_exchange_rate
+                            elif quote['currency'] == 'GBP':
+                                price = price * 1.17
+                            selected_price = price
+                            
+                            st.info(f"💰 Precio apertura {order_date_str}: {quote['price']:.2f} {quote['currency']} = {price:.2f} € | EUR/USD: {date_exchange_rate:.4f}")
         
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            units = st.number_input("Unidades", min_value=1, value=1)
+            default_units = editing_order['units'] if editing_order else 1
+            units = st.number_input("Unidades", min_value=1, value=default_units)
         
         with col2:
-            price = st.number_input("Precio (€)", min_value=0.01, value=selected_price if selected_price > 0 else 100.0, format="%.2f")
+            default_price = editing_order['price'] if editing_order else (selected_price if selected_price > 0 else 100.0)
+            price = st.number_input("Precio (€)", min_value=0.01, value=default_price, format="%.2f")
         
         with col3:
-            default_commission_eur = DEFAULT_COMMISSION_USD / date_exchange_rate
+            default_commission = editing_order.get('commission', DEFAULT_COMMISSION_USD / date_exchange_rate) if editing_order else DEFAULT_COMMISSION_USD / date_exchange_rate
             commission = st.number_input(
                 f"Comisión (€)", 
                 min_value=0.0, 
-                value=round(default_commission_eur, 2), 
-                format="%.2f",
-                help=f"Por defecto: {DEFAULT_COMMISSION_USD} USD = {default_commission_eur:.2f} EUR"
+                value=round(default_commission, 2), 
+                format="%.2f"
             )
         
         with col4:
-            system = st.selectbox("Sistema (opcional)", [""] + SYSTEMS)
+            default_system = editing_order.get('system', '') if editing_order else ''
+            system_options = [""] + SYSTEMS
+            system_idx = system_options.index(default_system) if default_system in system_options else 0
+            system = st.selectbox("Sistema (opcional)", system_options, index=system_idx)
         
         subtotal = units * price
         total = subtotal + commission
@@ -1352,22 +1389,43 @@ def page_orders():
         with col3:
             st.metric("Total", f"{total:,.2f} €")
         
-        if st.button("✅ Registrar Orden", type="primary", disabled=not selected_ticker):
-            order = {
-                'id': int(datetime.now().timestamp() * 1000),
-                'date': order_date_str,
-                'type': order_type,
-                'ticker': selected_ticker,
-                'units': units,
-                'price': round(price, 2),
-                'total': round(subtotal, 2),
-                'commission': round(commission, 2),
-                'system': system
-            }
-            data['orders'].insert(0, order)
-            save_data(data)
-            st.success(f"✅ Orden de {order_type} registrada: {units} {selected_ticker} @ {price:.2f} € + {commission:.2f}€ comisión")
-            st.rerun()
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            btn_label = "✅ Actualizar Orden" if editing_order else "✅ Registrar Orden"
+            if st.button(btn_label, type="primary", disabled=not selected_ticker, use_container_width=True):
+                order = {
+                    'id': editing_order['id'] if editing_order else int(datetime.now().timestamp() * 1000),
+                    'date': order_date_str,
+                    'type': order_type,
+                    'ticker': selected_ticker,
+                    'units': units,
+                    'price': round(price, 2),
+                    'total': round(subtotal, 2),
+                    'commission': round(commission, 2),
+                    'system': system
+                }
+                
+                if editing_order:
+                    # Actualizar orden existente
+                    for i, o in enumerate(data['orders']):
+                        if o['id'] == editing_order['id']:
+                            data['orders'][i] = order
+                            break
+                    st.session_state.editing_order = None
+                    st.success(f"✅ Orden actualizada")
+                else:
+                    data['orders'].insert(0, order)
+                    st.success(f"✅ Orden registrada")
+                
+                save_data(data)
+                st.rerun()
+        
+        with col2:
+            if editing_order:
+                if st.button("❌ Cancelar Edición", use_container_width=True):
+                    st.session_state.editing_order = None
+                    st.rerun()
     
     st.markdown("---")
     col1, col2, col3, col4 = st.columns(4)
@@ -1389,42 +1447,116 @@ def page_orders():
     st.subheader("📋 Historial de Órdenes")
     
     if data['orders']:
-        orders_to_delete = None
+        order_to_delete = None
+        order_to_edit = None
+        
+        # Headers
+        cols = st.columns([1.1, 0.9, 1, 0.7, 0.9, 0.9, 0.7, 0.9, 0.3, 0.3])
+        headers = ['Fecha', 'Tipo', 'Ticker', 'Uds', 'Precio', 'Total', 'Com.', 'Sistema', '', '']
+        for col, header in zip(cols, headers):
+            col.write(f"**{header}**")
         
         for idx, order in enumerate(data['orders']):
-            col1, col2, col3, col4, col5, col6, col7, col8, col9 = st.columns([1.1, 0.9, 1, 0.7, 0.9, 0.9, 0.7, 0.9, 0.4])
+            cols = st.columns([1.1, 0.9, 1, 0.7, 0.9, 0.9, 0.7, 0.9, 0.3, 0.3])
             
-            with col1:
-                st.write(order['date'])
-            with col2:
-                tipo = '🟢 COMPRA' if order['type'] == 'BUY' else '🔴 VENTA'
-                st.write(tipo)
-            with col3:
-                st.write(order['ticker'])
-            with col4:
-                st.write(order['units'])
-            with col5:
-                st.write(f"{order['price']:.2f} €")
-            with col6:
-                st.write(f"{order['total']:.2f} €")
-            with col7:
-                comm = order.get('commission', 0)
-                st.write(f"{comm:.2f} €")
-            with col8:
-                st.write(order.get('system', '-') or '-')
-            with col9:
-                if st.button("🗑️", key=f"del_order_{idx}_{order['id']}"):
-                    orders_to_delete = idx
+            cols[0].write(order['date'])
+            cols[1].write('🟢 BUY' if order['type'] == 'BUY' else '🔴 SELL')
+            cols[2].write(order['ticker'])
+            cols[3].write(order['units'])
+            cols[4].write(f"{order['price']:.2f}€")
+            cols[5].write(f"{order['total']:.2f}€")
+            cols[6].write(f"{order.get('commission', 0):.2f}€")
+            cols[7].write(order.get('system', '-') or '-')
+            
+            if cols[8].button("✏️", key=f"edit_{idx}_{order['id']}"):
+                order_to_edit = order
+            
+            if cols[9].button("🗑️", key=f"del_{idx}_{order['id']}"):
+                order_to_delete = idx
         
-        if orders_to_delete is not None:
-            data['orders'].pop(orders_to_delete)
+        if order_to_edit:
+            st.session_state.editing_order = order_to_edit
+            st.rerun()
+        
+        if order_to_delete is not None:
+            data['orders'].pop(order_to_delete)
             save_data(data)
             st.rerun()
     else:
         st.info("No hay órdenes registradas.")
 
+def page_contributions():
+    """Página de gestión de aportaciones"""
+    data = get_session_state()
+    
+    st.subheader("💰 Aportaciones de Capital")
+    
+    # Formulario nueva aportación
+    with st.expander("➕ Nueva Aportación", expanded=True):
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            contrib_date = st.date_input("Fecha", datetime.now(), key="contrib_date")
+        
+        with col2:
+            contrib_amount = st.number_input("Cantidad (€)", min_value=0.0, value=1000.0, step=100.0)
+        
+        with col3:
+            contrib_note = st.text_input("Nota (opcional)", placeholder="Ej: Aportación mensual")
+        
+        if st.button("✅ Registrar Aportación", type="primary"):
+            contribution = {
+                'id': int(datetime.now().timestamp() * 1000),
+                'date': contrib_date.strftime('%Y-%m-%d'),
+                'amount': contrib_amount,
+                'note': contrib_note
+            }
+            data['contributions'].append(contribution)
+            save_data(data)
+            st.success(f"✅ Aportación de {contrib_amount:,.2f}€ registrada")
+            st.rerun()
+    
+    st.markdown("---")
+    
+    # Resumen
+    total_contributions = sum(c['amount'] for c in data.get('contributions', []))
+    base_capital = data['settings']['capital']
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Capital Base", f"{base_capital:,.0f} €")
+    with col2:
+        st.metric("Total Aportaciones", f"{total_contributions:,.0f} €")
+    with col3:
+        st.metric("Capital Total", f"{base_capital + total_contributions:,.0f} €")
+    
+    st.markdown("---")
+    st.subheader("📋 Historial de Aportaciones")
+    
+    if data.get('contributions'):
+        contrib_to_delete = None
+        
+        for idx, contrib in enumerate(sorted(data['contributions'], key=lambda x: x['date'], reverse=True)):
+            col1, col2, col3, col4 = st.columns([1.5, 1.5, 2, 0.5])
+            
+            with col1:
+                st.write(contrib['date'])
+            with col2:
+                st.write(f"**{contrib['amount']:,.2f} €**")
+            with col3:
+                st.write(contrib.get('note', '-') or '-')
+            with col4:
+                if st.button("🗑️", key=f"del_contrib_{idx}_{contrib['id']}"):
+                    contrib_to_delete = contrib['id']
+        
+        if contrib_to_delete is not None:
+            data['contributions'] = [c for c in data['contributions'] if c['id'] != contrib_to_delete]
+            save_data(data)
+            st.rerun()
+    else:
+        st.info("No hay aportaciones registradas.")
+
 def page_portfolio():
-    """Página de cartera"""
     data = get_session_state()
     positions = calculate_positions(data)
     
@@ -1445,7 +1577,6 @@ def page_portfolio():
                     })
             
             save_data(data)
-            # Limpiar cache para recalcular
             get_historical_prices.clear()
             get_exchange_rate_history.clear()
             st.success("✅ Precios actualizados")
@@ -1477,8 +1608,9 @@ def page_portfolio():
                     st.metric("Valor", f"{pos['market_value']:.2f} €")
                 
                 with col6:
-                    color = "normal" if pos['pnl'] >= 0 else "inverse"
-                    st.metric("P&L", f"{pos['pnl']:+.2f} €", f"{pos['pnl_pct']:+.2f}%", delta_color=color)
+                    # CORREGIDO: Usar siempre delta_color="normal" para que negativo = rojo
+                    st.metric("P&L", f"{pos['pnl']:+.2f} €", f"{pos['pnl_pct']:+.2f}%", 
+                             delta_color="normal")
                 
                 with col7:
                     if st.button("Vender", key=f"sell_{ticker}"):
@@ -1533,7 +1665,6 @@ def page_portfolio():
         st.info("No hay posiciones en cartera.")
 
 def page_etfs():
-    """Página de gestión de ETFs"""
     data = get_session_state()
     
     st.subheader("📚 Base de Datos de ETFs")
@@ -1649,7 +1780,6 @@ def page_etfs():
         st.info("No hay ETFs guardados. Usa el buscador para añadir.")
 
 def page_settings():
-    """Página de configuración"""
     data = get_session_state()
     
     st.subheader("⚙️ Configuración")
@@ -1660,11 +1790,11 @@ def page_settings():
     
     with col1:
         new_capital = st.number_input(
-            "Capital Total (€)",
+            "Capital Base (€)",
             min_value=1000,
             value=data['settings']['capital'],
             step=500,
-            help="Capital total de la cartera"
+            help="Capital inicial de la cartera (sin aportaciones)"
         )
     
     with col2:
@@ -1674,13 +1804,12 @@ def page_settings():
             min_value=0,
             max_value=new_capital - 1000,
             value=current_reserve,
-            step=100,
-            help="Cantidad reservada que no se usará para inversiones"
+            step=100
         )
     
     with col3:
-        effective = new_capital - new_reserve
-        st.metric("Capital Efectivo", f"{effective:,.0f} €")
+        total = get_total_capital_with_contributions(data)
+        st.metric("Capital Total (con aportaciones)", f"{total:,.0f} €")
     
     if new_capital != data['settings']['capital'] or new_reserve != current_reserve:
         if st.button("💾 Guardar Configuración de Capital", type="primary"):
@@ -1689,8 +1818,6 @@ def page_settings():
             save_data(data)
             st.success("✅ Configuración actualizada")
             st.rerun()
-    
-    st.info(f"ℹ️ Se reservan {new_reserve}€ de liquidez para evitar problemas de ejecución. Los cálculos de asignación se realizan sobre el capital efectivo ({effective:,.0f}€).")
     
     st.markdown("---")
     
@@ -1722,11 +1849,6 @@ def page_settings():
     
     st.markdown("---")
     
-    st.markdown("### 💸 Comisión por Defecto")
-    st.info(f"La comisión por defecto es de **{DEFAULT_COMMISSION_USD} USD** por orden, que se convierte automáticamente a EUR según el tipo de cambio del día de la orden.")
-    
-    st.markdown("---")
-    
     st.markdown("### 💾 Exportar / Importar Datos")
     
     col1, col2 = st.columns(2)
@@ -1745,10 +1867,15 @@ def page_settings():
         if uploaded:
             try:
                 imported = json.load(uploaded)
+                # Migración
                 if 'reserve' not in imported.get('settings', {}):
                     imported['settings']['reserve'] = 500
                 if 'benchmark' not in imported.get('settings', {}):
                     imported['settings']['benchmark'] = 'SPY'
+                if 'allocations' not in imported:
+                    imported['allocations'] = {}
+                if 'contributions' not in imported:
+                    imported['contributions'] = []
                 st.session_state.data = imported
                 save_data(imported)
                 st.success("✅ Datos importados")
@@ -1766,17 +1893,14 @@ def page_settings():
         get_exchange_rate.clear()
         get_exchange_rate_history.clear()
         search_ticker.clear()
-        st.success("✅ Cache limpiado. Los precios se actualizarán en la próxima consulta.")
+        st.success("✅ Cache limpiado")
     
     st.markdown("---")
     
     st.markdown("### ⚠️ Zona de Peligro")
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if st.button("🗑️ Borrar TODOS los Datos", type="secondary", use_container_width=True):
-            st.session_state.confirm_delete = True
+    if st.button("🗑️ Borrar TODOS los Datos", type="secondary", use_container_width=True):
+        st.session_state.confirm_delete = True
     
     if st.session_state.get('confirm_delete', False):
         st.warning("⚠️ Esta acción eliminará todos los datos. ¿Estás seguro?")
@@ -1787,7 +1911,9 @@ def page_settings():
                     'settings': {'capital': 15000, 'reserve': 500, 'benchmark': 'SPY'},
                     'etfs': {},
                     'signals': {},
+                    'allocations': {},
                     'orders': [],
+                    'contributions': [],
                     'snapshots': []
                 }
                 save_data(st.session_state.data)
@@ -1805,11 +1931,12 @@ def page_settings():
 def main():
     render_header()
     
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "📊 Dashboard",
         "📈 Señales",
         "📐 Asignación",
         "📝 Órdenes",
+        "💰 Aportaciones",
         "💼 Cartera",
         "📚 ETFs",
         "⚙️ Config"
@@ -1828,12 +1955,15 @@ def main():
         page_orders()
     
     with tab5:
-        page_portfolio()
+        page_contributions()
     
     with tab6:
-        page_etfs()
+        page_portfolio()
     
     with tab7:
+        page_etfs()
+    
+    with tab8:
         page_settings()
 
 if __name__ == "__main__":
