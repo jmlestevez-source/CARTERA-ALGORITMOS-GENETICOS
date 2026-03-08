@@ -220,14 +220,14 @@ def load_data() -> dict:
         try:
             with open(DATA_FILE, 'r') as f:
                 loaded_data = json.load(f)
+                # Asegurar que todos los campos existan
+                for key in default_data:
+                    if key not in loaded_data:
+                        loaded_data[key] = default_data[key]
                 if 'reserve' not in loaded_data.get('settings', {}):
                     loaded_data['settings']['reserve'] = 500
                 if 'benchmark' not in loaded_data.get('settings', {}):
                     loaded_data['settings']['benchmark'] = 'SPY'
-                if 'allocations' not in loaded_data:
-                    loaded_data['allocations'] = {}
-                if 'contributions' not in loaded_data:
-                    loaded_data['contributions'] = []
                 return loaded_data
         except:
             pass
@@ -559,13 +559,13 @@ def calculate_benchmark_history(benchmark: str, start_date: str) -> pd.DataFrame
     return hist[['Close']]
 
 def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = None, positions: dict = None) -> dict:
+    """Calcula métricas de rendimiento del portfolio - VERSIÓN CORREGIDA"""
     if portfolio_df.empty:
         return {}
     
     portfolio_df = portfolio_df.copy()
     
-    portfolio_df['capital_change'] = portfolio_df['total_capital'].diff().fillna(0)
-    portfolio_df['adjusted_value'] = portfolio_df['total_value'] - portfolio_df['capital_change'].cumsum()
+    # Calcular retornos diarios
     portfolio_df['returns'] = portfolio_df['total_value'].pct_change()
     
     returns = portfolio_df['returns'].dropna()
@@ -579,24 +579,35 @@ def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = N
             'winning_positions': 0, 'losing_positions': 0, 'total_positions': 0
         }
     
-    initial_value = portfolio_df['total_value'].iloc[0]
+    # ✅ CORRECCIÓN: Calcular retorno correctamente
+    initial_capital = portfolio_df['total_capital'].iloc[0]
     final_value = portfolio_df['total_value'].iloc[-1]
     total_contributions = portfolio_df['contributions'].iloc[-1] - portfolio_df['contributions'].iloc[0]
     
-    total_return = final_value - initial_value - total_contributions
-    initial_capital = portfolio_df['total_capital'].iloc[0]
-    total_return_pct = (total_return / initial_capital) * 100 if initial_capital > 0 else 0
+    # Capital total invertido (inicial + aportaciones)
+    total_capital_invested = initial_capital + total_contributions
     
+    # Retorno absoluto = Valor final - Capital total aportado
+    total_return = final_value - total_capital_invested
+    
+    # Retorno porcentual sobre el capital total aportado
+    total_return_pct = (total_return / total_capital_invested) * 100 if total_capital_invested > 0 else 0
+    
+    # Días y años
     days = (portfolio_df.index[-1] - portfolio_df.index[0]).days
     years = days / 365.25
-    if years > 0 and initial_value > 0:
-        cumulative_return = (1 + returns).prod()
-        cagr = (cumulative_return ** (1 / years) - 1) * 100
+    
+    # CAGR
+    if years > 0 and total_capital_invested > 0:
+        # CAGR = (Valor Final / Capital Invertido)^(1/años) - 1
+        cagr = ((final_value / total_capital_invested) ** (1 / years) - 1) * 100
     else:
         cagr = 0
     
+    # Volatilidad anualizada
     volatility = returns.std() * np.sqrt(252) * 100
     
+    # Sharpe Ratio
     risk_free_rate = 0.02
     excess_returns = returns - (risk_free_rate / 252)
     if returns.std() > 0:
@@ -604,18 +615,21 @@ def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = N
     else:
         sharpe = 0
     
+    # Sortino Ratio
     negative_returns = returns[returns < 0]
     if len(negative_returns) > 0 and negative_returns.std() > 0:
         sortino = (excess_returns.mean() / negative_returns.std()) * np.sqrt(252)
     else:
         sortino = 0
     
+    # Drawdown
     portfolio_df['peak'] = portfolio_df['total_value'].cummax()
     portfolio_df['drawdown'] = (portfolio_df['total_value'] - portfolio_df['peak']) / portfolio_df['peak'] * 100
     
     max_drawdown = portfolio_df['drawdown'].min()
     current_drawdown = portfolio_df['drawdown'].iloc[-1]
     
+    # Estadísticas diarias
     best_day = returns.max() * 100
     worst_day = returns.min() * 100
     
@@ -627,6 +641,7 @@ def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = N
     losses = abs(returns[returns < 0].sum())
     profit_factor = gains / losses if losses > 0 else 0
     
+    # Estadísticas de posiciones
     winning_positions = 0
     losing_positions = 0
     if positions:
@@ -659,13 +674,13 @@ def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = N
         'total_positions': total_positions
     }
     
+    # Métricas de benchmark
     if benchmark_df is not None and not benchmark_df.empty:
         aligned = portfolio_df.join(benchmark_df, how='inner', rsuffix='_bench')
         
         if len(aligned) > 1:
             bench_initial = aligned['Close'].iloc[0]
             bench_final = aligned['Close'].iloc[-1]
-            
             bench_returns = aligned['Close'].pct_change().dropna()
             
             metrics['bench_return_pct'] = ((bench_final / bench_initial) - 1) * 100
@@ -679,10 +694,13 @@ def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = N
             
             metrics['bench_volatility'] = bench_returns.std() * np.sqrt(252) * 100
             
+            # Drawdown del benchmark
             aligned['bench_peak'] = aligned['Close'].cummax()
             aligned['bench_drawdown'] = (aligned['Close'] - aligned['bench_peak']) / aligned['bench_peak'] * 100
             metrics['bench_max_drawdown'] = aligned['bench_drawdown'].min()
+            metrics['bench_current_drawdown'] = aligned['bench_drawdown'].iloc[-1]
             
+            # Alpha y Beta
             if len(bench_returns) > 0 and bench_returns.std() > 0:
                 port_returns = aligned['total_value'].pct_change().dropna()
                 common_idx = port_returns.index.intersection(bench_returns.index)
@@ -1143,15 +1161,35 @@ def page_dashboard():
         col1, col2 = st.columns(2)
         
         with col1:
-            st.subheader("📈 Curva de Equity")
+            st.subheader("📈 Curva de Equity y Drawdown")
             
+            # Normalizar portfolio
             portfolio_df['normalized'] = (portfolio_df['total_value'] / portfolio_df['total_value'].iloc[0]) * 100
             
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                               vertical_spacing=0.1,
-                               row_heights=[0.7, 0.3],
-                               subplot_titles=('Valor Normalizado (Base 100)', 'Drawdown (%)'))
+            # Calcular drawdown del portfolio
+            portfolio_df['peak'] = portfolio_df['total_value'].cummax()
+            portfolio_df['drawdown'] = (portfolio_df['total_value'] - portfolio_df['peak']) / portfolio_df['peak'] * 100
             
+            # Preparar datos del benchmark
+            benchmark_aligned = None
+            if not benchmark_df.empty:
+                benchmark_aligned = benchmark_df.reindex(portfolio_df.index, method='ffill')
+                if not benchmark_aligned.empty and 'Close' in benchmark_aligned.columns:
+                    first_valid = benchmark_aligned['Close'].first_valid_index()
+                    if first_valid is not None:
+                        benchmark_aligned['normalized'] = (benchmark_aligned['Close'] / benchmark_aligned['Close'].loc[first_valid]) * 100
+                        benchmark_aligned['bench_peak'] = benchmark_aligned['Close'].cummax()
+                        benchmark_aligned['bench_drawdown'] = (benchmark_aligned['Close'] - benchmark_aligned['bench_peak']) / benchmark_aligned['bench_peak'] * 100
+            
+            fig = make_subplots(
+                rows=2, cols=1, 
+                shared_xaxes=True, 
+                vertical_spacing=0.08,
+                row_heights=[0.65, 0.35],
+                subplot_titles=('Valor Normalizado (Base 100)', 'Drawdown (%)')
+            )
+            
+            # Gráfico de Equity - Portfolio
             fig.add_trace(
                 go.Scatter(
                     x=portfolio_df.index,
@@ -1164,28 +1202,21 @@ def page_dashboard():
                 row=1, col=1
             )
             
-            if not benchmark_df.empty:
-                benchmark_aligned = benchmark_df.reindex(portfolio_df.index, method='ffill')
-                if not benchmark_aligned.empty and 'Close' in benchmark_aligned.columns:
-                    first_valid = benchmark_aligned['Close'].first_valid_index()
-                    if first_valid is not None:
-                        benchmark_aligned['normalized'] = (benchmark_aligned['Close'] / benchmark_aligned['Close'].loc[first_valid]) * 100
-                        
-                        fig.add_trace(
-                            go.Scatter(
-                                x=benchmark_aligned.index,
-                                y=benchmark_aligned['normalized'],
-                                mode='lines',
-                                name=selected_benchmark,
-                                line=dict(color='#f59e0b', width=2, dash='dash'),
-                                hovertemplate='%{x|%d/%m/%Y}<br>' + selected_benchmark + ': %{y:.2f}<extra></extra>'
-                            ),
-                            row=1, col=1
-                        )
+            # Gráfico de Equity - Benchmark
+            if benchmark_aligned is not None and 'normalized' in benchmark_aligned.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=benchmark_aligned.index,
+                        y=benchmark_aligned['normalized'],
+                        mode='lines',
+                        name=selected_benchmark,
+                        line=dict(color='#f59e0b', width=2, dash='dash'),
+                        hovertemplate='%{x|%d/%m/%Y}<br>' + selected_benchmark + ': %{y:.2f}<extra></extra>'
+                    ),
+                    row=1, col=1
+                )
             
-            portfolio_df['peak'] = portfolio_df['total_value'].cummax()
-            portfolio_df['drawdown'] = (portfolio_df['total_value'] - portfolio_df['peak']) / portfolio_df['peak'] * 100
-            
+            # Gráfico de Drawdown - Portfolio
             fig.add_trace(
                 go.Scatter(
                     x=portfolio_df.index,
@@ -1195,23 +1226,51 @@ def page_dashboard():
                     fill='tozeroy',
                     line=dict(color='#ef4444', width=1),
                     fillcolor='rgba(239,68,68,0.3)',
-                    hovertemplate='%{x|%d/%m/%Y}<br>Drawdown: %{y:.2f}%<extra></extra>'
+                    hovertemplate='%{x|%d/%m/%Y}<br>DD Portfolio: %{y:.2f}%<extra></extra>'
                 ),
                 row=2, col=1
             )
             
+            # Gráfico de Drawdown - Benchmark
+            if benchmark_aligned is not None and 'bench_drawdown' in benchmark_aligned.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=benchmark_aligned.index,
+                        y=benchmark_aligned['bench_drawdown'],
+                        mode='lines',
+                        name=f'DD {selected_benchmark}',
+                        fill='tozeroy',
+                        line=dict(color='#f59e0b', width=1, dash='dash'),
+                        fillcolor='rgba(245,158,11,0.2)',
+                        hovertemplate='%{x|%d/%m/%Y}<br>DD ' + selected_benchmark + ': %{y:.2f}%<extra></extra>'
+                    ),
+                    row=2, col=1
+                )
+            
             fig.update_layout(
-                height=500,
+                height=550,
                 plot_bgcolor='rgba(0,0,0,0)',
                 paper_bgcolor='rgba(0,0,0,0)',
                 font_color='#94a3b8',
                 showlegend=True,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                legend=dict(
+                    orientation="h", 
+                    yanchor="bottom", 
+                    y=1.02, 
+                    xanchor="right", 
+                    x=1,
+                    font=dict(size=10)
+                ),
                 hovermode='x unified'
             )
             
             fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(148,163,184,0.1)')
             fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(148,163,184,0.1)')
+            
+            # Ajustar eje Y del drawdown para que sea más legible
+            fig.update_yaxes(row=2, col=1, range=[min(portfolio_df['drawdown'].min(), 
+                                                       benchmark_aligned['bench_drawdown'].min() if benchmark_aligned is not None and 'bench_drawdown' in benchmark_aligned.columns else 0) * 1.1, 
+                                                   1])
             
             st.plotly_chart(fig, use_container_width=True)
         
@@ -2092,33 +2151,107 @@ def page_settings():
     col1, col2 = st.columns(2)
     
     with col1:
+        # Preparar datos para exportar (incluyendo señales)
+        export_data = {
+            'settings': data.get('settings', {}),
+            'etfs': data.get('etfs', {}),
+            'signals': data.get('signals', {}),
+            'allocations': data.get('allocations', {}),
+            'orders': data.get('orders', []),
+            'contributions': data.get('contributions', []),
+            'snapshots': data.get('snapshots', []),
+            'export_date': datetime.now().isoformat(),
+            'export_version': '2.0'
+        }
+        
         st.download_button(
-            label="📥 Descargar Backup (JSON)",
-            data=json.dumps(data, indent=2, default=str),
-            file_name=f"portfolio_backup_{datetime.now().strftime('%Y%m%d')}.json",
+            label="📥 Descargar Backup Completo (JSON)",
+            data=json.dumps(export_data, indent=2, default=str, ensure_ascii=False),
+            file_name=f"portfolio_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
             mime="application/json",
             use_container_width=True
         )
+        
+        # Mostrar resumen de lo que se exporta
+        num_signals = len(data.get('signals', {}))
+        num_orders = len(data.get('orders', []))
+        num_etfs = len(data.get('etfs', {}))
+        st.caption(f"📊 {num_signals} meses de señales | 📝 {num_orders} órdenes | 📚 {num_etfs} ETFs")
     
     with col2:
         uploaded = st.file_uploader("📤 Importar Backup", type=['json'])
         if uploaded:
             try:
                 imported = json.load(uploaded)
+                
+                # Validar y completar campos faltantes
+                if 'settings' not in imported:
+                    imported['settings'] = {'capital': 15000, 'reserve': 500, 'benchmark': 'SPY'}
                 if 'reserve' not in imported.get('settings', {}):
                     imported['settings']['reserve'] = 500
                 if 'benchmark' not in imported.get('settings', {}):
                     imported['settings']['benchmark'] = 'SPY'
+                if 'etfs' not in imported:
+                    imported['etfs'] = {}
+                if 'signals' not in imported:
+                    imported['signals'] = {}
                 if 'allocations' not in imported:
                     imported['allocations'] = {}
+                if 'orders' not in imported:
+                    imported['orders'] = []
                 if 'contributions' not in imported:
                     imported['contributions'] = []
-                st.session_state.data = imported
-                save_data(imported)
-                st.success("✅ Datos importados")
-                st.rerun()
+                if 'snapshots' not in imported:
+                    imported['snapshots'] = []
+                
+                # Mostrar resumen de lo que se va a importar
+                num_signals = len(imported.get('signals', {}))
+                num_orders = len(imported.get('orders', []))
+                num_etfs = len(imported.get('etfs', {}))
+                
+                st.info(f"📊 {num_signals} meses de señales | 📝 {num_orders} órdenes | 📚 {num_etfs} ETFs")
+                
+                if st.button("✅ Confirmar Importación", type="primary"):
+                    st.session_state.data = imported
+                    save_data(imported)
+                    st.success("✅ Datos importados correctamente")
+                    st.rerun()
+                    
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(f"Error al importar: {e}")
+    
+    st.markdown("---")
+    
+    # Mostrar señales guardadas
+    st.markdown("### 📈 Señales Guardadas")
+    
+    signals = data.get('signals', {})
+    if signals:
+        signals_summary = []
+        for key, sys_signals in sorted(signals.items(), reverse=True):
+            year, month = key.split('-')
+            month_name = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 
+                         'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'][int(month)-1]
+            
+            total_buy = sum(len(s.get('buy', [])) for s in sys_signals.values())
+            total_hold = sum(len(s.get('hold', [])) for s in sys_signals.values())
+            total_sell = sum(len(s.get('sell', [])) for s in sys_signals.values())
+            
+            has_allocation = key in data.get('allocations', {})
+            
+            signals_summary.append({
+                'Mes': f"{month_name} {year}",
+                'Comprar': total_buy,
+                'Mantener': total_hold,
+                'Vender': total_sell,
+                'Asignación': '✅' if has_allocation else '❌'
+            })
+        
+        if signals_summary:
+            df_signals = pd.DataFrame(signals_summary)
+            st.dataframe(df_signals, use_container_width=True, hide_index=True)
+    else:
+        st.info("No hay señales guardadas.")
     
     st.markdown("---")
     
