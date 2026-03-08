@@ -11,8 +11,8 @@ import os
 # CONFIGURACIÓN DE LA PÁGINA
 # ============================================
 st.set_page_config(
-    page_title="Portfolio Manager Pro",
-    page_icon="📈",
+    page_title="Cartera Algoritmos Genéticos",
+    page_icon="🧬",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -40,14 +40,22 @@ st.markdown("""
     .negative { color: #ef4444; }
     .stTabs [data-baseweb="tab-list"] {
         gap: 8px;
+        background-color: transparent;
     }
     .stTabs [data-baseweb="tab"] {
-        background-color: #1e293b;
+        background-color: #f1f5f9;
+        color: #1e293b;
         border-radius: 8px;
         padding: 10px 20px;
+        font-weight: 500;
     }
     .stTabs [aria-selected="true"] {
         background: linear-gradient(135deg, #0ea5e9, #6366f1);
+        color: white;
+    }
+    /* Mejorar visibilidad del texto en pestañas */
+    [data-testid="stMarkdownContainer"] {
+        color: #1e293b;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -87,18 +95,34 @@ def search_ticker(query: str) -> list:
         return []
 
 @st.cache_data(ttl=60)
-def get_quote(symbol: str) -> dict:
-    """Obtiene cotización de Yahoo Finance"""
+def get_quote(symbol: str, date: str = None) -> dict:
+    """Obtiene cotización de Yahoo Finance para una fecha específica o actual"""
     try:
         ticker = yf.Ticker(symbol)
         info = ticker.info
-        hist = ticker.history(period="5d")
         
-        if hist.empty:
-            return None
-        
-        current_price = hist['Close'].iloc[-1]
-        prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
+        if date:
+            # Obtener precio de apertura para fecha específica
+            start_date = datetime.strptime(date, '%Y-%m-%d')
+            end_date = start_date + timedelta(days=1)
+            hist = ticker.history(start=start_date, end=end_date)
+            
+            if hist.empty:
+                # Si no hay datos para esa fecha, buscar el día anterior más cercano
+                hist = ticker.history(period="5d", end=end_date)
+            
+            if not hist.empty:
+                current_price = hist['Open'].iloc[-1]  # Usar precio de apertura
+                prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
+            else:
+                return None
+        else:
+            # Precio actual
+            hist = ticker.history(period="5d")
+            if hist.empty:
+                return None
+            current_price = hist['Close'].iloc[-1]
+            prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
         
         return {
             'symbol': symbol,
@@ -115,13 +139,25 @@ def get_quote(symbol: str) -> dict:
         return {'symbol': symbol, 'success': False, 'error': str(e)}
 
 @st.cache_data(ttl=300)
-def get_exchange_rate() -> float:
-    """Obtiene tipo de cambio EUR/USD"""
+def get_exchange_rate(date: str = None) -> float:
+    """Obtiene tipo de cambio EUR/USD para una fecha específica o actual"""
     try:
         ticker = yf.Ticker("EURUSD=X")
-        hist = ticker.history(period="1d")
-        if not hist.empty:
-            return hist['Close'].iloc[-1]
+        
+        if date:
+            start_date = datetime.strptime(date, '%Y-%m-%d')
+            end_date = start_date + timedelta(days=1)
+            hist = ticker.history(start=start_date, end=end_date)
+            
+            if hist.empty:
+                hist = ticker.history(period="5d", end=end_date)
+            
+            if not hist.empty:
+                return hist['Open'].iloc[-1]  # Usar precio de apertura
+        else:
+            hist = ticker.history(period="1d")
+            if not hist.empty:
+                return hist['Close'].iloc[-1]
     except:
         pass
     return 1.08
@@ -315,7 +351,7 @@ def render_header():
     col1, col2, col3 = st.columns([2, 1, 1])
     
     with col1:
-        st.markdown('<p class="main-header">📈 Portfolio Manager Pro</p>', unsafe_allow_html=True)
+        st.markdown('<p class="main-header">🧬 Cartera Algoritmos Genéticos</p>', unsafe_allow_html=True)
         st.caption("Gestión de cartera multi-sistema con datos de Yahoo Finance")
     
     with col2:
@@ -689,13 +725,14 @@ def page_orders():
             order_type = st.radio("Tipo", ["BUY", "SELL"], horizontal=True)
         
         with col2:
-            order_date = st.date_input("Fecha", datetime.now())
+            order_date = st.date_input("Fecha", datetime.now(), key="order_date_input")
         
         # Buscador de ticker
         search = st.text_input("🔍 Buscar ETF/Acción", key="order_search")
         
         selected_ticker = None
         selected_price = 0.0
+        order_date_str = order_date.strftime('%Y-%m-%d')
         
         if search:
             results = search_ticker(search)
@@ -705,9 +742,11 @@ def page_orders():
                 if selected:
                     selected_ticker = selected.split(" - ")[0]
                     
-                    # Obtener precio actual
+                    # Obtener precio para la fecha seleccionada
                     with st.spinner("Obteniendo precio..."):
-                        quote = get_quote(selected_ticker)
+                        quote = get_quote(selected_ticker, order_date_str)
+                        # Obtener tipo de cambio para esa fecha
+                        date_exchange_rate = get_exchange_rate(order_date_str)
                     
                     if quote and quote.get('success'):
                         # Guardar ETF en la base de datos
@@ -722,12 +761,12 @@ def page_orders():
                         # Convertir precio a EUR
                         price = quote['price']
                         if quote['currency'] == 'USD':
-                            price = price / st.session_state.exchange_rate
+                            price = price / date_exchange_rate
                         elif quote['currency'] == 'GBP':
                             price = price * 1.17
                         selected_price = price
                         
-                        st.info(f"💰 Precio actual: {quote['price']:.2f} {quote['currency']} = {price:.2f} € | Cambio: {quote.get('change_pct', 0):+.2f}%")
+                        st.info(f"💰 Precio apertura {order_date_str}: {quote['price']:.2f} {quote['currency']} = {price:.2f} € | EUR/USD: {date_exchange_rate:.4f}")
         
         col1, col2, col3 = st.columns(3)
         
@@ -746,7 +785,7 @@ def page_orders():
         if st.button("✅ Registrar Orden", type="primary", disabled=not selected_ticker):
             order = {
                 'id': int(datetime.now().timestamp() * 1000),
-                'date': order_date.strftime('%Y-%m-%d'),
+                'date': order_date_str,
                 'type': order_type,
                 'ticker': selected_ticker,
                 'units': units,
@@ -812,7 +851,7 @@ def page_orders():
             with col7:
                 st.write(row['Sistema'])
             with col8:
-                if st.button("🗑️", key=f"del_{row['ID']}"):
+                if st.button("🗑️", key=f"del_order_{row['ID']}"):
                     data['orders'].pop(row['ID'])
                     save_data(data)
                     st.rerun()
