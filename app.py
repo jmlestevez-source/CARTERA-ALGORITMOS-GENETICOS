@@ -52,6 +52,9 @@ st.markdown("""
     [data-testid="stMarkdownContainer"] {
         color: #1e293b;
     }
+    [data-testid="stMetricDelta"] svg {
+        display: none;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -208,7 +211,6 @@ def load_data() -> dict:
         try:
             with open(DATA_FILE, 'r') as f:
                 loaded_data = json.load(f)
-                # Migración de datos antiguos
                 if 'reserve' not in loaded_data.get('settings', {}):
                     loaded_data['settings']['reserve'] = 500
                 if 'benchmark' not in loaded_data.get('settings', {}):
@@ -241,10 +243,70 @@ def get_reserve(data: dict) -> float:
     return data['settings'].get('reserve', 500)
 
 def get_total_capital_with_contributions(data: dict) -> float:
-    """Calcula el capital total incluyendo aportaciones"""
     base_capital = data['settings']['capital']
     total_contributions = sum(c['amount'] for c in data.get('contributions', []))
     return base_capital + total_contributions
+
+def get_systems_for_ticker(data: dict, ticker: str) -> list:
+    """Obtiene los sistemas asignados a un ticker desde las señales guardadas del mes actual"""
+    now = datetime.now()
+    key = f"{now.year}-{now.month}"
+    
+    # Buscar en señales del mes actual
+    signals = data['signals'].get(key, {})
+    systems = []
+    
+    for system in SYSTEMS:
+        sys_signals = signals.get(system, {'buy': [], 'hold': [], 'sell': []})
+        active_etfs = sys_signals.get('buy', []) + sys_signals.get('hold', [])
+        if ticker in active_etfs:
+            systems.append(system)
+    
+    # Si no se encuentra en el mes actual, buscar en meses anteriores
+    if not systems:
+        for month_offset in range(1, 13):
+            check_month = now.month - month_offset
+            check_year = now.year
+            if check_month <= 0:
+                check_month += 12
+                check_year -= 1
+            
+            key = f"{check_year}-{check_month}"
+            signals = data['signals'].get(key, {})
+            
+            for system in SYSTEMS:
+                sys_signals = signals.get(system, {'buy': [], 'hold': [], 'sell': []})
+                active_etfs = sys_signals.get('buy', []) + sys_signals.get('hold', [])
+                if ticker in active_etfs:
+                    systems.append(system)
+            
+            if systems:
+                break
+    
+    return systems
+
+def get_current_allocation(data: dict) -> dict:
+    """Obtiene la asignación del mes actual o la más reciente"""
+    now = datetime.now()
+    key = f"{now.year}-{now.month}"
+    
+    # Buscar asignación del mes actual
+    if key in data['allocations']:
+        return data['allocations'][key].get('allocation', {})
+    
+    # Buscar en meses anteriores
+    for month_offset in range(1, 13):
+        check_month = now.month - month_offset
+        check_year = now.year
+        if check_month <= 0:
+            check_month += 12
+            check_year -= 1
+        
+        key = f"{check_year}-{check_month}"
+        if key in data['allocations']:
+            return data['allocations'][key].get('allocation', {})
+    
+    return {}
 
 # ============================================
 # FUNCIONES DE CÁLCULO
@@ -258,6 +320,9 @@ def calculate_positions(data: dict) -> dict:
     for order in sorted_orders:
         ticker = order['ticker']
         if ticker not in positions:
+            # Obtener sistemas desde las señales guardadas
+            systems_from_signals = get_systems_for_ticker(data, ticker)
+            
             positions[ticker] = {
                 'units': 0,
                 'total_cost': 0,
@@ -267,7 +332,7 @@ def calculate_positions(data: dict) -> dict:
                 'market_value': 0,
                 'pnl': 0,
                 'pnl_pct': 0,
-                'systems': []
+                'systems': systems_from_signals  # Usar sistemas de señales
             }
         
         pos = positions[ticker]
@@ -277,6 +342,7 @@ def calculate_positions(data: dict) -> dict:
             pos['total_cost'] += order['total'] + commission
             pos['total_commission'] += commission
             pos['units'] += order['units']
+            # También añadir sistemas de la orden si los tiene
             if order.get('system'):
                 for s in order['system'].split(', '):
                     if s and s not in pos['systems']:
@@ -312,8 +378,46 @@ def calculate_positions(data: dict) -> dict:
     
     return positions
 
+def calculate_system_distribution(data: dict, positions: dict) -> dict:
+    """Calcula la distribución por sistema basándose en las señales guardadas"""
+    current_allocation = get_current_allocation(data)
+    
+    system_values = {s: 0 for s in SYSTEMS}
+    
+    if current_allocation:
+        # Usar la asignación guardada para calcular pesos
+        total_weight = sum(item.get('weight', 0) for item in current_allocation.values())
+        
+        for ticker, pos in positions.items():
+            if ticker in current_allocation:
+                alloc_item = current_allocation[ticker]
+                systems = alloc_item.get('systems', [])
+                
+                if systems:
+                    # Distribuir el valor de mercado entre los sistemas asignados
+                    value_per_system = pos['market_value'] / len(systems)
+                    for sys in systems:
+                        if sys in system_values:
+                            system_values[sys] += value_per_system
+            else:
+                # Si el ticker no está en la asignación, usar los sistemas de la posición
+                if pos['systems']:
+                    value_per_system = pos['market_value'] / len(pos['systems'])
+                    for sys in pos['systems']:
+                        if sys in system_values:
+                            system_values[sys] += value_per_system
+    else:
+        # Fallback: usar los sistemas de las posiciones
+        for pos in positions.values():
+            if pos['systems']:
+                value_per_system = pos['market_value'] / len(pos['systems'])
+                for sys in pos['systems']:
+                    if sys in system_values:
+                        system_values[sys] += value_per_system
+    
+    return system_values
+
 def calculate_portfolio_history(data: dict) -> pd.DataFrame:
-    """Calcula el histórico del valor del portfolio basado en órdenes y aportaciones"""
     if not data['orders']:
         return pd.DataFrame()
     
@@ -348,14 +452,12 @@ def calculate_portfolio_history(data: dict) -> pd.DataFrame:
     for date in date_range:
         date_str = date.strftime('%Y-%m-%d')
         
-        # Calcular capital total hasta esta fecha (base + aportaciones)
         contributions_to_date = sum(
             c['amount'] for c in sorted_contributions 
             if c['date'] <= date_str
         )
         total_capital = base_capital + contributions_to_date
         
-        # Calcular posiciones a esta fecha
         positions_at_date = {}
         total_invested = 0
         
@@ -381,7 +483,6 @@ def calculate_portfolio_history(data: dict) -> pd.DataFrame:
                     positions_at_date[ticker]['units'] -= order['units']
                     total_invested -= order['total']
         
-        # Calcular valor de mercado
         market_value = 0
         for ticker, pos in positions_at_date.items():
             if pos['units'] <= 0:
@@ -448,13 +549,12 @@ def calculate_benchmark_history(benchmark: str, start_date: str) -> pd.DataFrame
     
     return hist[['Close']]
 
-def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = None, capital: float = 15000) -> dict:
+def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = None, positions: dict = None) -> dict:
     if portfolio_df.empty:
         return {}
     
     portfolio_df = portfolio_df.copy()
     
-    # Calcular retornos ajustados por aportaciones (TWR - Time Weighted Return)
     portfolio_df['capital_change'] = portfolio_df['total_capital'].diff().fillna(0)
     portfolio_df['adjusted_value'] = portfolio_df['total_value'] - portfolio_df['capital_change'].cumsum()
     portfolio_df['returns'] = portfolio_df['total_value'].pct_change()
@@ -466,23 +566,21 @@ def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = N
             'total_return': 0, 'total_return_pct': 0, 'cagr': 0,
             'volatility': 0, 'sharpe': 0, 'sortino': 0,
             'max_drawdown': 0, 'current_drawdown': 0,
-            'best_day': 0, 'worst_day': 0, 'win_rate': 0, 'profit_factor': 0
+            'best_day': 0, 'worst_day': 0, 'win_rate_days': 0, 'profit_factor': 0,
+            'winning_positions': 0, 'losing_positions': 0, 'total_positions': 0
         }
     
     initial_value = portfolio_df['total_value'].iloc[0]
     final_value = portfolio_df['total_value'].iloc[-1]
     total_contributions = portfolio_df['contributions'].iloc[-1] - portfolio_df['contributions'].iloc[0]
     
-    # Retorno total ajustado por aportaciones
     total_return = final_value - initial_value - total_contributions
     initial_capital = portfolio_df['total_capital'].iloc[0]
     total_return_pct = (total_return / initial_capital) * 100 if initial_capital > 0 else 0
     
-    # CAGR
     days = (portfolio_df.index[-1] - portfolio_df.index[0]).days
     years = days / 365.25
     if years > 0 and initial_value > 0:
-        # TWR CAGR
         cumulative_return = (1 + returns).prod()
         cagr = (cumulative_return ** (1 / years) - 1) * 100
     else:
@@ -514,11 +612,22 @@ def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = N
     
     winning_days = (returns > 0).sum()
     total_days = len(returns)
-    win_rate = (winning_days / total_days) * 100 if total_days > 0 else 0
+    win_rate_days = (winning_days / total_days) * 100 if total_days > 0 else 0
     
     gains = returns[returns > 0].sum()
     losses = abs(returns[returns < 0].sum())
     profit_factor = gains / losses if losses > 0 else 0
+    
+    winning_positions = 0
+    losing_positions = 0
+    if positions:
+        for pos in positions.values():
+            if pos['pnl'] > 0:
+                winning_positions += 1
+            elif pos['pnl'] < 0:
+                losing_positions += 1
+    
+    total_positions = winning_positions + losing_positions
     
     metrics = {
         'total_return': total_return,
@@ -531,11 +640,14 @@ def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = N
         'current_drawdown': current_drawdown,
         'best_day': best_day,
         'worst_day': worst_day,
-        'win_rate': win_rate,
+        'win_rate_days': win_rate_days,
         'profit_factor': profit_factor,
         'peak': portfolio_df['peak'].iloc[-1],
         'days': days,
-        'total_contributions': total_contributions
+        'total_contributions': total_contributions,
+        'winning_positions': winning_positions,
+        'losing_positions': losing_positions,
+        'total_positions': total_positions
     }
     
     if benchmark_df is not None and not benchmark_df.empty:
@@ -588,11 +700,9 @@ def calculate_metrics(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame = N
     return metrics
 
 def calculate_and_save_allocation(data: dict, month: int, year: int) -> dict:
-    """Calcula y guarda la asignación fija para un mes"""
     key = f"{year}-{month}"
     signals = data['signals'].get(key, {})
     
-    # Usar el capital efectivo del momento en que se guardan las señales
     effective_capital = get_effective_capital(data)
     exchange_rate = st.session_state.get('exchange_rate', 1.08)
     
@@ -641,7 +751,6 @@ def calculate_and_save_allocation(data: dict, month: int, year: int) -> dict:
             item['total_units'] = int(item['total_capital'] / item['price_eur'])
         item['weight'] = (item['total_capital'] / effective_capital * 100)
     
-    # Guardar la asignación fija
     data['allocations'][key] = {
         'allocation': allocation,
         'effective_capital': effective_capital,
@@ -652,17 +761,14 @@ def calculate_and_save_allocation(data: dict, month: int, year: int) -> dict:
     return allocation
 
 def get_allocation(data: dict, month: int, year: int) -> dict:
-    """Obtiene la asignación guardada o la calcula si no existe"""
     key = f"{year}-{month}"
     
     if key in data['allocations']:
         return data['allocations'][key]['allocation']
     
-    # Si no existe, calcular (pero no guardar automáticamente)
     return calculate_allocation_dynamic(data, month, year)
 
 def calculate_allocation_dynamic(data: dict, month: int, year: int) -> dict:
-    """Calcula la asignación dinámicamente (sin guardar)"""
     key = f"{year}-{month}"
     signals = data['signals'].get(key, {})
     effective_capital = get_effective_capital(data)
@@ -784,44 +890,37 @@ def page_dashboard():
     stats = calculate_stats(data, positions)
     
     # Métricas principales
+    st.subheader("📊 Resumen de Cartera")
+    
     col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
-        delta_color = "normal" if stats['pnl'] >= 0 else "inverse"
-        st.metric(
-            "💰 Valor Total",
-            f"{stats['total_value']:,.2f} €",
-            f"{stats['pnl_pct']:+.2f}%" if stats['total_invested'] > 0 else None,
-            delta_color=delta_color
-        )
+        pnl_color = "🟢" if stats['pnl'] >= 0 else "🔴"
+        st.markdown("**💰 Valor Total**")
+        st.markdown(f"### {stats['total_value']:,.2f} €")
+        if stats['total_invested'] > 0:
+            st.markdown(f"{pnl_color} {stats['pnl_pct']:+.2f}%")
     
     with col2:
-        st.metric(
-            "📊 P&L Total",
-            f"{stats['pnl']:+,.2f} €",
-            f"Invertido: {stats['total_invested']:,.0f} €"
-        )
+        pnl_color = "🟢" if stats['pnl'] >= 0 else "🔴"
+        st.markdown("**📊 P&L Total**")
+        st.markdown(f"### {pnl_color} {stats['pnl']:+,.2f} €")
+        st.caption(f"Invertido: {stats['total_invested']:,.0f} €")
     
     with col3:
-        st.metric(
-            "💵 Liquidez Disponible",
-            f"{stats['available_cash']:,.2f} €",
-            f"Reserva: {stats['reserve']:.0f}€"
-        )
+        st.markdown("**💵 Liquidez Disponible**")
+        st.markdown(f"### {stats['available_cash']:,.2f} €")
+        st.caption(f"Reserva: {stats['reserve']:.0f}€")
     
     with col4:
-        st.metric(
-            "💸 Comisiones",
-            f"{stats['total_commissions']:,.2f} €",
-            f"{len(data['orders'])} órdenes"
-        )
+        st.markdown("**💸 Comisiones**")
+        st.markdown(f"### {stats['total_commissions']:,.2f} €")
+        st.caption(f"{len(data['orders'])} órdenes")
     
     with col5:
-        st.metric(
-            "📦 Posiciones",
-            stats['num_positions'],
-            f"Aportaciones: {stats['total_contributions']:,.0f}€"
-        )
+        st.markdown("**📦 Posiciones**")
+        st.markdown(f"### {stats['num_positions']}")
+        st.caption(f"Aportaciones: {stats['total_contributions']:,.0f}€")
     
     st.markdown("---")
     
@@ -850,41 +949,74 @@ def page_dashboard():
         first_date = portfolio_df.index[0].strftime('%Y-%m-%d')
         benchmark_df = calculate_benchmark_history(selected_benchmark, first_date)
         
-        metrics = calculate_metrics(portfolio_df, benchmark_df, stats['total_capital'])
+        metrics = calculate_metrics(portfolio_df, benchmark_df, positions)
         
         st.subheader("📈 Métricas de Rendimiento")
         
         col1, col2, col3, col4, col5, col6 = st.columns(6)
         
         with col1:
-            color = "🟢" if metrics.get('total_return_pct', 0) >= 0 else "🔴"
-            st.metric(f"{color} Retorno Total", f"{metrics.get('total_return_pct', 0):.2f}%",
-                     f"{metrics.get('total_return', 0):+,.2f}€")
+            ret_color = "🟢" if metrics.get('total_return_pct', 0) >= 0 else "🔴"
+            st.markdown("**Retorno Total**")
+            st.markdown(f"### {ret_color} {metrics.get('total_return_pct', 0):+.2f}%")
+            st.caption(f"{metrics.get('total_return', 0):+,.2f}€")
+        
         with col2:
-            st.metric("📊 CAGR", f"{metrics.get('cagr', 0):.2f}%")
+            cagr_color = "🟢" if metrics.get('cagr', 0) >= 0 else "🔴"
+            st.markdown("**CAGR**")
+            st.markdown(f"### {cagr_color} {metrics.get('cagr', 0):+.2f}%")
+        
         with col3:
-            st.metric("📉 Max Drawdown", f"{metrics.get('max_drawdown', 0):.2f}%")
+            st.markdown("**Max Drawdown**")
+            st.markdown(f"### 🔴 {metrics.get('max_drawdown', 0):.2f}%")
+        
         with col4:
-            st.metric("📉 DD Actual", f"{metrics.get('current_drawdown', 0):.2f}%")
+            st.markdown("**DD Actual**")
+            dd_val = metrics.get('current_drawdown', 0)
+            dd_color = "🟢" if dd_val == 0 else "🔴"
+            st.markdown(f"### {dd_color} {dd_val:.2f}%")
+        
         with col5:
-            st.metric("⚡ Sharpe Ratio", f"{metrics.get('sharpe', 0):.2f}")
+            sharpe_color = "🟢" if metrics.get('sharpe', 0) >= 0 else "🔴"
+            st.markdown("**Sharpe Ratio**")
+            st.markdown(f"### {sharpe_color} {metrics.get('sharpe', 0):.2f}")
+        
         with col6:
-            st.metric("🎯 Sortino Ratio", f"{metrics.get('sortino', 0):.2f}")
+            sortino_color = "🟢" if metrics.get('sortino', 0) >= 0 else "🔴"
+            st.markdown("**Sortino Ratio**")
+            st.markdown(f"### {sortino_color} {metrics.get('sortino', 0):.2f}")
         
         col1, col2, col3, col4, col5, col6 = st.columns(6)
         
         with col1:
-            st.metric("📊 Volatilidad", f"{metrics.get('volatility', 0):.2f}%")
+            st.markdown("**Volatilidad**")
+            st.markdown(f"### {metrics.get('volatility', 0):.2f}%")
+        
         with col2:
-            st.metric("✅ Win Rate", f"{metrics.get('win_rate', 0):.1f}%")
+            win_pos = metrics.get('winning_positions', 0)
+            lose_pos = metrics.get('losing_positions', 0)
+            total_pos = metrics.get('total_positions', 0)
+            st.markdown("**Posiciones +/-**")
+            st.markdown(f"### 🟢{win_pos} / 🔴{lose_pos}")
+            st.caption(f"de {total_pos} totales")
+        
         with col3:
-            st.metric("🏆 Mejor Día", f"{metrics.get('best_day', 0):+.2f}%")
+            st.markdown("**Mejor Día**")
+            st.markdown(f"### 🟢 {metrics.get('best_day', 0):+.2f}%")
+        
         with col4:
-            st.metric("💔 Peor Día", f"{metrics.get('worst_day', 0):.2f}%")
+            st.markdown("**Peor Día**")
+            st.markdown(f"### 🔴 {metrics.get('worst_day', 0):.2f}%")
+        
         with col5:
-            st.metric("💹 Profit Factor", f"{metrics.get('profit_factor', 0):.2f}")
+            pf_color = "🟢" if metrics.get('profit_factor', 0) >= 1 else "🔴"
+            st.markdown("**Profit Factor**")
+            st.markdown(f"### {pf_color} {metrics.get('profit_factor', 0):.2f}")
+        
         with col6:
-            st.metric("📅 Días", f"{metrics.get('days', 0)}")
+            st.markdown("**Días Trading**")
+            st.markdown(f"### {metrics.get('days', 0)}")
+            st.caption(f"Win rate días: {metrics.get('win_rate_days', 0):.0f}%")
         
         if 'bench_return_pct' in metrics:
             st.markdown("---")
@@ -894,18 +1026,29 @@ def page_dashboard():
             
             with col1:
                 diff = metrics['total_return_pct'] - metrics.get('bench_return_pct', 0)
-                color = "🟢" if diff >= 0 else "🔴"
-                st.metric(f"Retorno {selected_benchmark}", 
-                         f"{metrics.get('bench_return_pct', 0):.2f}%",
-                         f"{color} Dif: {diff:+.2f}%")
+                diff_color = "🟢" if diff >= 0 else "🔴"
+                bench_color = "🟢" if metrics.get('bench_return_pct', 0) >= 0 else "🔴"
+                st.markdown(f"**Retorno {selected_benchmark}**")
+                st.markdown(f"### {bench_color} {metrics.get('bench_return_pct', 0):+.2f}%")
+                st.caption(f"Diferencia: {diff_color} {diff:+.2f}%")
+            
             with col2:
-                st.metric(f"CAGR {selected_benchmark}", f"{metrics.get('bench_cagr', 0):.2f}%")
+                cagr_bench_color = "🟢" if metrics.get('bench_cagr', 0) >= 0 else "🔴"
+                st.markdown(f"**CAGR {selected_benchmark}**")
+                st.markdown(f"### {cagr_bench_color} {metrics.get('bench_cagr', 0):+.2f}%")
+            
             with col3:
-                st.metric(f"Max DD {selected_benchmark}", f"{metrics.get('bench_max_drawdown', 0):.2f}%")
+                st.markdown(f"**Max DD {selected_benchmark}**")
+                st.markdown(f"### 🔴 {metrics.get('bench_max_drawdown', 0):.2f}%")
+            
             with col4:
-                st.metric("Alpha", f"{metrics.get('alpha', 0):.2f}%")
+                alpha_color = "🟢" if metrics.get('alpha', 0) >= 0 else "🔴"
+                st.markdown("**Alpha**")
+                st.markdown(f"### {alpha_color} {metrics.get('alpha', 0):+.2f}%")
+            
             with col5:
-                st.metric("Beta", f"{metrics.get('beta', 0):.2f}")
+                st.markdown("**Beta**")
+                st.markdown(f"### {metrics.get('beta', 0):.2f}")
         
         st.markdown("---")
         
@@ -937,19 +1080,21 @@ def page_dashboard():
             if not benchmark_df.empty:
                 benchmark_aligned = benchmark_df.reindex(portfolio_df.index, method='ffill')
                 if not benchmark_aligned.empty and 'Close' in benchmark_aligned.columns:
-                    benchmark_aligned['normalized'] = (benchmark_aligned['Close'] / benchmark_aligned['Close'].iloc[0]) * 100
-                    
-                    fig.add_trace(
-                        go.Scatter(
-                            x=benchmark_aligned.index,
-                            y=benchmark_aligned['normalized'],
-                            mode='lines',
-                            name=selected_benchmark,
-                            line=dict(color='#f59e0b', width=2, dash='dash'),
-                            hovertemplate='%{x|%d/%m/%Y}<br>' + selected_benchmark + ': %{y:.2f}<extra></extra>'
-                        ),
-                        row=1, col=1
-                    )
+                    first_valid = benchmark_aligned['Close'].first_valid_index()
+                    if first_valid is not None:
+                        benchmark_aligned['normalized'] = (benchmark_aligned['Close'] / benchmark_aligned['Close'].loc[first_valid]) * 100
+                        
+                        fig.add_trace(
+                            go.Scatter(
+                                x=benchmark_aligned.index,
+                                y=benchmark_aligned['normalized'],
+                                mode='lines',
+                                name=selected_benchmark,
+                                line=dict(color='#f59e0b', width=2, dash='dash'),
+                                hovertemplate='%{x|%d/%m/%Y}<br>' + selected_benchmark + ': %{y:.2f}<extra></extra>'
+                            ),
+                            row=1, col=1
+                        )
             
             portfolio_df['peak'] = portfolio_df['total_value'].cummax()
             portfolio_df['drawdown'] = (portfolio_df['total_value'] - portfolio_df['peak']) / portfolio_df['peak'] * 100
@@ -987,12 +1132,10 @@ def page_dashboard():
             st.subheader("🎯 Distribución por Sistema")
             
             if positions:
-                system_values = {s: 0 for s in SYSTEMS}
-                for pos in positions.values():
-                    for sys in pos['systems']:
-                        if sys in system_values:
-                            system_values[sys] += pos['market_value'] / len(pos['systems'])
+                # Usar la nueva función que calcula desde las señales
+                system_values = calculate_system_distribution(data, positions)
                 
+                # Filtrar sistemas con valor
                 system_values = {k: v for k, v in system_values.items() if v > 0}
                 
                 if system_values:
@@ -1011,8 +1154,15 @@ def page_dashboard():
                         legend=dict(orientation="h", yanchor="bottom", y=-0.2)
                     )
                     st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Mostrar tabla de distribución
+                    st.markdown("**Detalle por sistema:**")
+                    total_value = sum(system_values.values())
+                    for sys, value in sorted(system_values.items(), key=lambda x: -x[1]):
+                        pct = (value / total_value * 100) if total_value > 0 else 0
+                        st.caption(f"{sys}: {value:,.2f}€ ({pct:.1f}%)")
                 else:
-                    st.info("No hay posiciones asignadas a sistemas.")
+                    st.warning("⚠️ No hay señales guardadas para asignar sistemas a las posiciones. Ve a 'Señales' y guarda las señales del mes.")
             else:
                 st.info("No hay posiciones para mostrar.")
     else:
@@ -1026,6 +1176,8 @@ def page_dashboard():
         pos_data = []
         for ticker, pos in positions.items():
             etf_info = data['etfs'].get(ticker, {})
+            pnl_emoji = "🟢" if pos['pnl'] >= 0 else "🔴"
+            systems_str = ', '.join(pos['systems']) if pos['systems'] else 'Sin asignar'
             pos_data.append({
                 'Ticker': ticker,
                 'Nombre': etf_info.get('name', ticker)[:40],
@@ -1033,9 +1185,9 @@ def page_dashboard():
                 'P. Medio': f"{pos['avg_price']:.2f} €",
                 'P. Actual': f"{pos['current_price']:.2f} €",
                 'Valor': f"{pos['market_value']:.2f} €",
-                'P&L': f"{pos['pnl']:+.2f} €",
-                'P&L %': f"{pos['pnl_pct']:+.2f}%",
-                'Sistemas': ', '.join(pos['systems'])
+                'P&L': f"{pnl_emoji} {pos['pnl']:+.2f} €",
+                'P&L %': f"{pnl_emoji} {pos['pnl_pct']:+.2f}%",
+                'Sistemas': systems_str
             })
         
         df = pd.DataFrame(pos_data)
@@ -1066,7 +1218,6 @@ def page_signals():
     if key not in data['signals']:
         data['signals'][key] = {sys: {'buy': [], 'hold': [], 'sell': []} for sys in SYSTEMS}
     
-    # Mostrar si hay asignación guardada
     if key in data['allocations']:
         alloc_info = data['allocations'][key]
         st.success(f"✅ Asignación guardada el {alloc_info.get('created_at', 'N/A')[:10]} con capital efectivo de {alloc_info.get('effective_capital', 0):,.0f}€")
@@ -1164,9 +1315,7 @@ def page_signals():
     
     with col1:
         if st.button("💾 Guardar Señales y Calcular Asignación", type="primary", use_container_width=True):
-            # Guardar señales
             save_data(data)
-            # Calcular y guardar asignación fija
             calculate_and_save_allocation(data, month, year)
             save_data(data)
             st.success("✅ Señales guardadas y asignación calculada")
@@ -1215,7 +1364,6 @@ def page_allocation():
         cap = data['allocations'][key].get('effective_capital', effective_capital) if key in data['allocations'] else effective_capital
         st.metric("Por Sistema", f"{cap/5:,.0f} €")
     
-    # Obtener asignación (guardada o calculada)
     allocation = get_allocation(data, month, year)
     
     if key in data['allocations']:
@@ -1291,7 +1439,6 @@ def page_orders():
     
     st.subheader("📝 Registro de Órdenes")
     
-    # Verificar si hay una orden siendo editada
     editing_order = st.session_state.get('editing_order', None)
     
     with st.expander("➕ Nueva Orden" if not editing_order else "✏️ Editar Orden", expanded=True):
@@ -1407,7 +1554,6 @@ def page_orders():
                 }
                 
                 if editing_order:
-                    # Actualizar orden existente
                     for i, o in enumerate(data['orders']):
                         if o['id'] == editing_order['id']:
                             data['orders'][i] = order
@@ -1450,7 +1596,6 @@ def page_orders():
         order_to_delete = None
         order_to_edit = None
         
-        # Headers
         cols = st.columns([1.1, 0.9, 1, 0.7, 0.9, 0.9, 0.7, 0.9, 0.3, 0.3])
         headers = ['Fecha', 'Tipo', 'Ticker', 'Uds', 'Precio', 'Total', 'Com.', 'Sistema', '', '']
         for col, header in zip(cols, headers):
@@ -1486,12 +1631,10 @@ def page_orders():
         st.info("No hay órdenes registradas.")
 
 def page_contributions():
-    """Página de gestión de aportaciones"""
     data = get_session_state()
     
     st.subheader("💰 Aportaciones de Capital")
     
-    # Formulario nueva aportación
     with st.expander("➕ Nueva Aportación", expanded=True):
         col1, col2, col3 = st.columns(3)
         
@@ -1518,7 +1661,6 @@ def page_contributions():
     
     st.markdown("---")
     
-    # Resumen
     total_contributions = sum(c['amount'] for c in data.get('contributions', []))
     base_capital = data['settings']['capital']
     
@@ -1587,13 +1729,14 @@ def page_portfolio():
     if positions:
         for ticker, pos in positions.items():
             etf_info = data['etfs'].get(ticker, {})
+            systems_str = ', '.join(pos['systems']) if pos['systems'] else 'Sin asignar'
             
             with st.container():
                 col1, col2, col3, col4, col5, col6, col7 = st.columns([2, 1, 1, 1, 1.2, 1.2, 1])
                 
                 with col1:
                     st.write(f"**{ticker}**")
-                    st.caption(etf_info.get('name', '')[:30])
+                    st.caption(f"{etf_info.get('name', '')[:25]} | {systems_str}")
                 
                 with col2:
                     st.metric("Unidades", pos['units'])
@@ -1608,9 +1751,10 @@ def page_portfolio():
                     st.metric("Valor", f"{pos['market_value']:.2f} €")
                 
                 with col6:
-                    # CORREGIDO: Usar siempre delta_color="normal" para que negativo = rojo
-                    st.metric("P&L", f"{pos['pnl']:+.2f} €", f"{pos['pnl_pct']:+.2f}%", 
-                             delta_color="normal")
+                    pnl_color = "🟢" if pos['pnl'] >= 0 else "🔴"
+                    st.markdown("**P&L**")
+                    st.markdown(f"### {pnl_color} {pos['pnl']:+.2f} €")
+                    st.caption(f"{pnl_color} {pos['pnl_pct']:+.2f}%")
                 
                 with col7:
                     if st.button("Vender", key=f"sell_{ticker}"):
@@ -1867,7 +2011,6 @@ def page_settings():
         if uploaded:
             try:
                 imported = json.load(uploaded)
-                # Migración
                 if 'reserve' not in imported.get('settings', {}):
                     imported['settings']['reserve'] = 500
                 if 'benchmark' not in imported.get('settings', {}):
