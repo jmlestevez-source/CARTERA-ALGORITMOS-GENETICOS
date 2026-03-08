@@ -53,7 +53,6 @@ st.markdown("""
         background: linear-gradient(135deg, #0ea5e9, #6366f1);
         color: white;
     }
-    /* Mejorar visibilidad del texto en pestañas */
     [data-testid="stMarkdownContainer"] {
         color: #1e293b;
     }
@@ -65,7 +64,6 @@ st.markdown("""
 # ============================================
 SYSTEMS = ['CEG', 'DGSE', 'DDG', 'EIR', 'Colossus']
 DATA_FILE = 'portfolio_data.json'
-RESERVE_LIQUIDITY = 500  # Liquidez mínima reservada en EUR
 DEFAULT_COMMISSION_USD = 2.0  # Comisión por defecto en USD
 
 # ============================================
@@ -104,22 +102,19 @@ def get_quote(symbol: str, date: str = None) -> dict:
         info = ticker.info
         
         if date:
-            # Obtener precio de apertura para fecha específica
             start_date = datetime.strptime(date, '%Y-%m-%d')
             end_date = start_date + timedelta(days=1)
             hist = ticker.history(start=start_date, end=end_date)
             
             if hist.empty:
-                # Si no hay datos para esa fecha, buscar el día anterior más cercano
                 hist = ticker.history(period="5d", end=end_date)
             
             if not hist.empty:
-                current_price = hist['Open'].iloc[-1]  # Usar precio de apertura
+                current_price = hist['Open'].iloc[-1]
                 prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
             else:
                 return None
         else:
-            # Precio actual
             hist = ticker.history(period="5d")
             if hist.empty:
                 return None
@@ -155,7 +150,7 @@ def get_exchange_rate(date: str = None) -> float:
                 hist = ticker.history(period="5d", end=end_date)
             
             if not hist.empty:
-                return hist['Open'].iloc[-1]  # Usar precio de apertura
+                return hist['Open'].iloc[-1]
         else:
             hist = ticker.history(period="1d")
             if not hist.empty:
@@ -167,7 +162,10 @@ def get_exchange_rate(date: str = None) -> float:
 def load_data() -> dict:
     """Carga datos desde archivo JSON"""
     default_data = {
-        'settings': {'capital': 15000},
+        'settings': {
+            'capital': 15000,
+            'reserve': 500
+        },
         'etfs': {},
         'signals': {},
         'orders': [],
@@ -177,7 +175,11 @@ def load_data() -> dict:
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, 'r') as f:
-                return json.load(f)
+                loaded_data = json.load(f)
+                # Asegurar que existe 'reserve' en settings (migración)
+                if 'reserve' not in loaded_data.get('settings', {}):
+                    loaded_data['settings']['reserve'] = 500
+                return loaded_data
         except:
             pass
     return default_data
@@ -197,7 +199,12 @@ def get_session_state():
 
 def get_effective_capital(data: dict) -> float:
     """Devuelve el capital efectivo (capital total - reserva de liquidez)"""
-    return data['settings']['capital'] - RESERVE_LIQUIDITY
+    reserve = data['settings'].get('reserve', 500)
+    return data['settings']['capital'] - reserve
+
+def get_reserve(data: dict) -> float:
+    """Devuelve la reserva de liquidez"""
+    return data['settings'].get('reserve', 500)
 
 # ============================================
 # FUNCIONES DE CÁLCULO
@@ -207,7 +214,6 @@ def calculate_positions(data: dict) -> dict:
     positions = {}
     exchange_rate = st.session_state.get('exchange_rate', 1.08)
     
-    # Ordenar por fecha
     sorted_orders = sorted(data['orders'], key=lambda x: x['date'])
     
     for order in sorted_orders:
@@ -236,20 +242,18 @@ def calculate_positions(data: dict) -> dict:
                 for s in order['system'].split(', '):
                     if s and s not in pos['systems']:
                         pos['systems'].append(s)
-        else:  # SELL
+        else:
             if pos['units'] > 0:
                 ratio = order['units'] / pos['units']
                 pos['total_cost'] -= pos['total_cost'] * ratio
                 pos['units'] -= order['units']
                 pos['total_commission'] += commission
     
-    # Calcular valores actuales
     for ticker, pos in list(positions.items()):
         if pos['units'] <= 0:
             del positions[ticker]
             continue
         
-        # Obtener precio actual
         etf_data = data['etfs'].get(ticker, {})
         if etf_data.get('price'):
             price = etf_data['price']
@@ -273,7 +277,7 @@ def calculate_allocation(data: dict, month: int, year: int) -> dict:
     """Calcula asignación basada en señales"""
     key = f"{year}-{month}"
     signals = data['signals'].get(key, {})
-    effective_capital = get_effective_capital(data)  # Usar capital efectivo
+    effective_capital = get_effective_capital(data)
     exchange_rate = st.session_state.get('exchange_rate', 1.08)
     
     allocation = {}
@@ -293,7 +297,6 @@ def calculate_allocation(data: dict, month: int, year: int) -> dict:
             price = etf_data.get('price', 0)
             currency = etf_data.get('currency', 'EUR')
             
-            # Convertir a EUR
             price_eur = price
             if currency == 'USD' and price > 0:
                 price_eur = price / exchange_rate
@@ -317,7 +320,6 @@ def calculate_allocation(data: dict, month: int, year: int) -> dict:
             allocation[ticker]['systems'].append(system)
             allocation[ticker]['total_capital'] += cap_per_etf
     
-    # Recalcular unidades consolidadas
     for ticker, item in allocation.items():
         if item['price_eur'] > 0:
             item['total_units'] = int(item['total_capital'] / item['price_eur'])
@@ -329,6 +331,7 @@ def calculate_stats(data: dict, positions: dict) -> dict:
     """Calcula estadísticas del portfolio"""
     capital = data['settings']['capital']
     effective_capital = get_effective_capital(data)
+    reserve = get_reserve(data)
     
     total_value = 0
     total_invested = 0
@@ -339,11 +342,10 @@ def calculate_stats(data: dict, positions: dict) -> dict:
         total_invested += pos['total_cost']
         total_commissions += pos.get('total_commission', 0)
     
-    # Calcular comisiones totales de todas las órdenes
     total_commissions = sum(o.get('commission', 0) for o in data['orders'])
     
     cash = max(0, capital - total_invested)
-    available_cash = max(0, cash - RESERVE_LIQUIDITY)  # Liquidez disponible (sin reserva)
+    available_cash = max(0, cash - reserve)
     pnl = total_value - total_invested
     pnl_pct = (pnl / total_invested * 100) if total_invested > 0 else 0
     
@@ -352,12 +354,47 @@ def calculate_stats(data: dict, positions: dict) -> dict:
         'total_invested': total_invested,
         'cash': cash,
         'available_cash': available_cash,
-        'reserve': RESERVE_LIQUIDITY,
+        'reserve': reserve,
         'total_commissions': total_commissions,
         'pnl': pnl,
         'pnl_pct': pnl_pct,
         'num_positions': len(positions),
         'effective_capital': effective_capital
+    }
+
+def calculate_drawdown(snapshots: list) -> dict:
+    """Calcula el drawdown máximo y actual"""
+    if not snapshots or len(snapshots) < 1:
+        return {'max_drawdown': 0, 'max_drawdown_pct': 0, 'current_drawdown_pct': 0}
+    
+    values = [s['total_value'] for s in snapshots]
+    
+    # Calcular máximo acumulado (peak)
+    peak = values[0]
+    max_drawdown = 0
+    max_drawdown_pct = 0
+    
+    for value in values:
+        if value > peak:
+            peak = value
+        
+        drawdown = peak - value
+        drawdown_pct = (drawdown / peak * 100) if peak > 0 else 0
+        
+        if drawdown_pct > max_drawdown_pct:
+            max_drawdown = drawdown
+            max_drawdown_pct = drawdown_pct
+    
+    # Drawdown actual
+    current_peak = max(values)
+    current_value = values[-1]
+    current_drawdown_pct = ((current_peak - current_value) / current_peak * 100) if current_peak > 0 else 0
+    
+    return {
+        'max_drawdown': max_drawdown,
+        'max_drawdown_pct': max_drawdown_pct,
+        'current_drawdown_pct': current_drawdown_pct,
+        'peak': current_peak
     }
 
 # ============================================
@@ -386,7 +423,8 @@ def render_header():
     with col4:
         data = get_session_state()
         effective = get_effective_capital(data)
-        st.metric("Capital Efectivo", f"{effective:,.0f} €", f"-{RESERVE_LIQUIDITY}€ reserva")
+        reserve = get_reserve(data)
+        st.metric("Capital Efectivo", f"{effective:,.0f} €", f"-{reserve:.0f}€ reserva")
 
 # ============================================
 # PÁGINAS
@@ -396,6 +434,7 @@ def page_dashboard():
     data = get_session_state()
     positions = calculate_positions(data)
     stats = calculate_stats(data, positions)
+    drawdown_stats = calculate_drawdown(data['snapshots'])
     
     # Métricas principales
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -421,7 +460,7 @@ def page_dashboard():
         st.metric(
             "💵 Liquidez Disponible",
             f"{stats['available_cash']:,.2f} €",
-            f"Reserva: {RESERVE_LIQUIDITY}€"
+            f"Reserva: {stats['reserve']:.0f}€"
         )
     
     with col4:
@@ -447,22 +486,63 @@ def page_dashboard():
         if data['snapshots']:
             df_snapshots = pd.DataFrame(data['snapshots'])
             df_snapshots['date'] = pd.to_datetime(df_snapshots['date'])
+            df_snapshots = df_snapshots.sort_values('date')
             
-            fig = px.line(
-                df_snapshots, x='date', y='total_value',
-                labels={'date': 'Fecha', 'total_value': 'Valor (€)'},
-            )
+            # Calcular máximo acumulado para drawdown
+            df_snapshots['peak'] = df_snapshots['total_value'].cummax()
+            df_snapshots['drawdown'] = (df_snapshots['peak'] - df_snapshots['total_value']) / df_snapshots['peak'] * 100
+            
+            # Crear figura con dos ejes Y
+            fig = go.Figure()
+            
+            # Curva de equity
+            fig.add_trace(go.Scatter(
+                x=df_snapshots['date'],
+                y=df_snapshots['total_value'],
+                mode='lines+markers',
+                name='Valor Portfolio',
+                line=dict(color='#0ea5e9', width=2),
+                marker=dict(size=8, color='#0ea5e9'),
+                fill='tozeroy',
+                fillcolor='rgba(14,165,233,0.1)',
+                hovertemplate='%{x|%d/%m/%Y}<br>Valor: %{y:,.2f}€<extra></extra>'
+            ))
+            
+            # Línea de máximo (peak)
+            fig.add_trace(go.Scatter(
+                x=df_snapshots['date'],
+                y=df_snapshots['peak'],
+                mode='lines',
+                name='Máximo Histórico',
+                line=dict(color='#10b981', width=1, dash='dash'),
+                hovertemplate='%{x|%d/%m/%Y}<br>Peak: %{y:,.2f}€<extra></extra>'
+            ))
+            
             fig.update_layout(
                 plot_bgcolor='rgba(0,0,0,0)',
                 paper_bgcolor='rgba(0,0,0,0)',
                 font_color='#94a3b8',
-                showlegend=False
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                hovermode='x unified',
+                yaxis=dict(title='Valor (€)', tickformat=','),
+                xaxis=dict(title='')
             )
-            fig.update_traces(line_color='#0ea5e9', fill='tozeroy', fillcolor='rgba(14,165,233,0.1)')
+            
             st.plotly_chart(fig, use_container_width=True)
+            
+            # Métricas de drawdown
+            col_dd1, col_dd2, col_dd3 = st.columns(3)
+            with col_dd1:
+                st.metric("📉 Max Drawdown", f"{drawdown_stats['max_drawdown_pct']:.2f}%", 
+                         f"-{drawdown_stats['max_drawdown']:,.2f}€")
+            with col_dd2:
+                st.metric("📊 Drawdown Actual", f"{drawdown_stats['current_drawdown_pct']:.2f}%")
+            with col_dd3:
+                st.metric("🏔️ Peak", f"{drawdown_stats['peak']:,.2f}€")
         else:
             st.info("No hay snapshots guardados. Usa el botón 'Guardar Snapshot' para empezar a trackear la evolución.")
-            if st.button("📸 Guardar Snapshot"):
+            if st.button("📸 Guardar Snapshot", key="snapshot_dashboard"):
                 data['snapshots'].append({
                     'date': datetime.now().isoformat(),
                     'total_value': stats['total_value'],
@@ -482,7 +562,6 @@ def page_dashboard():
                     if sys in system_values:
                         system_values[sys] += pos['market_value'] / len(pos['systems'])
             
-            # Añadir capital no invertido
             for sys in SYSTEMS:
                 if system_values[sys] == 0:
                     system_values[sys] = get_effective_capital(data) / len(SYSTEMS)
@@ -534,7 +613,6 @@ def page_signals():
     
     st.subheader("📊 Gestión de Señales Mensuales")
     
-    # Selector de mes/año
     col1, col2, col3 = st.columns([1, 1, 2])
     
     with col1:
@@ -553,7 +631,6 @@ def page_signals():
     if key not in data['signals']:
         data['signals'][key] = {sys: {'buy': [], 'hold': [], 'sell': []} for sys in SYSTEMS}
     
-    # Buscador de ETFs
     st.markdown("---")
     st.subheader("🔍 Buscar ETF en Yahoo Finance")
     
@@ -573,7 +650,6 @@ def page_signals():
                     st.caption(f"{result['name'][:50]} ({result['exchange']})")
                 with col3:
                     if st.button("➕", key=f"add_{result['symbol']}"):
-                        # Obtener datos del ETF
                         quote = get_quote(result['symbol'])
                         if quote and quote.get('success'):
                             data['etfs'][result['symbol']] = {
@@ -593,7 +669,6 @@ def page_signals():
     
     st.markdown("---")
     
-    # Grid de sistemas
     for i in range(0, len(SYSTEMS), 2):
         cols = st.columns(2)
         
@@ -606,7 +681,6 @@ def page_signals():
                     
                     sys_signals = data['signals'][key].get(system, {'buy': [], 'hold': [], 'sell': []})
                     
-                    # COMPRAR
                     st.markdown("**🟢 COMPRAR**")
                     buy_options = list(data['etfs'].keys())
                     current_buy = [t for t in sys_signals.get('buy', []) if t in buy_options]
@@ -618,7 +692,6 @@ def page_signals():
                         label_visibility="collapsed"
                     )
                     
-                    # MANTENER
                     st.markdown("**🟡 MANTENER**")
                     current_hold = [t for t in sys_signals.get('hold', []) if t in buy_options]
                     new_hold = st.multiselect(
@@ -629,7 +702,6 @@ def page_signals():
                         label_visibility="collapsed"
                     )
                     
-                    # VENDER
                     st.markdown("**🔴 VENDER**")
                     current_sell = [t for t in sys_signals.get('sell', []) if t in buy_options]
                     new_sell = st.multiselect(
@@ -640,7 +712,6 @@ def page_signals():
                         label_visibility="collapsed"
                     )
                     
-                    # Actualizar signals
                     data['signals'][key][system] = {
                         'buy': new_buy,
                         'hold': new_hold,
@@ -649,7 +720,6 @@ def page_signals():
                     
                     st.markdown("---")
     
-    # Botón guardar
     if st.button("💾 Guardar Señales", type="primary", use_container_width=True):
         save_data(data)
         st.success("✅ Señales guardadas correctamente")
@@ -658,10 +728,10 @@ def page_allocation():
     """Página de asignación calculada"""
     data = get_session_state()
     effective_capital = get_effective_capital(data)
+    reserve = get_reserve(data)
     
     st.subheader("📊 Asignación Calculada")
     
-    # Selector de mes
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
@@ -678,12 +748,11 @@ def page_allocation():
         year = st.selectbox("Año", range(2024, 2031), index=datetime.now().year - 2024, key="alloc_year")
     
     with col3:
-        st.metric("Capital Efectivo", f"{effective_capital:,.0f} €", f"Reserva: {RESERVE_LIQUIDITY}€")
+        st.metric("Capital Efectivo", f"{effective_capital:,.0f} €", f"Reserva: {reserve:.0f}€")
     
     with col4:
         st.metric("Por Sistema", f"{effective_capital/5:,.0f} €")
     
-    # Calcular asignación
     allocation = calculate_allocation(data, month, year)
     
     if allocation:
@@ -706,7 +775,6 @@ def page_allocation():
         df = pd.DataFrame(alloc_data)
         st.dataframe(df, use_container_width=True, hide_index=True)
         
-        # Botones de acción rápida
         st.markdown("---")
         st.subheader("⚡ Registro Rápido de Compras")
         
@@ -728,7 +796,6 @@ def page_allocation():
                 
                 with col5:
                     if st.button("Comprar", key=f"buy_alloc_{ticker}"):
-                        # Calcular comisión por defecto en EUR
                         exchange_rate = st.session_state.get('exchange_rate', 1.08)
                         commission_eur = DEFAULT_COMMISSION_USD / exchange_rate
                         
@@ -757,7 +824,6 @@ def page_orders():
     
     st.subheader("📝 Registro de Órdenes")
     
-    # Formulario nueva orden
     with st.expander("➕ Nueva Orden", expanded=True):
         col1, col2 = st.columns(2)
         
@@ -767,7 +833,6 @@ def page_orders():
         with col2:
             order_date = st.date_input("Fecha", datetime.now(), key="order_date_input")
         
-        # Buscador de ticker
         search = st.text_input("🔍 Buscar ETF/Acción", key="order_search")
         
         selected_ticker = None
@@ -783,14 +848,11 @@ def page_orders():
                 if selected:
                     selected_ticker = selected.split(" - ")[0]
                     
-                    # Obtener precio para la fecha seleccionada
                     with st.spinner("Obteniendo precio..."):
                         quote = get_quote(selected_ticker, order_date_str)
-                        # Obtener tipo de cambio para esa fecha
                         date_exchange_rate = get_exchange_rate(order_date_str)
                     
                     if quote and quote.get('success'):
-                        # Guardar ETF en la base de datos
                         data['etfs'][selected_ticker] = {
                             'yahooSymbol': selected_ticker,
                             'name': quote['name'],
@@ -799,7 +861,6 @@ def page_orders():
                             'change_pct': quote.get('change_pct', 0)
                         }
                         
-                        # Convertir precio a EUR
                         price = quote['price']
                         if quote['currency'] == 'USD':
                             price = price / date_exchange_rate
@@ -818,7 +879,6 @@ def page_orders():
             price = st.number_input("Precio (€)", min_value=0.01, value=selected_price if selected_price > 0 else 100.0, format="%.2f")
         
         with col3:
-            # Comisión por defecto: 2 USD convertidos a EUR
             default_commission_eur = DEFAULT_COMMISSION_USD / date_exchange_rate
             commission = st.number_input(
                 f"Comisión (€)", 
@@ -831,7 +891,6 @@ def page_orders():
         with col4:
             system = st.selectbox("Sistema (opcional)", [""] + SYSTEMS)
         
-        # Resumen de la orden
         subtotal = units * price
         total = subtotal + commission
         
@@ -860,7 +919,6 @@ def page_orders():
             st.success(f"✅ Orden de {order_type} registrada: {units} {selected_ticker} @ {price:.2f} € + {commission:.2f}€ comisión")
             st.rerun()
     
-    # Resumen
     st.markdown("---")
     col1, col2, col3, col4 = st.columns(4)
     
@@ -877,12 +935,10 @@ def page_orders():
     with col4:
         st.metric("💸 Total Comisiones", f"{total_commissions:,.2f} €")
     
-    # Tabla de órdenes
     st.markdown("---")
     st.subheader("📋 Historial de Órdenes")
     
     if data['orders']:
-        # Crear lista de órdenes para mostrar
         orders_to_delete = None
         
         for idx, order in enumerate(data['orders']):
@@ -910,7 +966,6 @@ def page_orders():
                 if st.button("🗑️", key=f"del_order_{idx}_{order['id']}"):
                     orders_to_delete = idx
         
-        # Eliminar orden si se marcó
         if orders_to_delete is not None:
             data['orders'].pop(orders_to_delete)
             save_data(data)
@@ -925,7 +980,6 @@ def page_portfolio():
     
     st.subheader("💼 Cartera Actual")
     
-    # Botón actualizar precios
     if st.button("🔄 Actualizar Precios", type="primary"):
         with st.spinner("Actualizando precios..."):
             st.session_state.exchange_rate = get_exchange_rate()
@@ -947,7 +1001,6 @@ def page_portfolio():
     st.markdown("---")
     
     if positions:
-        # Tabla de posiciones
         for ticker, pos in positions.items():
             etf_info = data['etfs'].get(ticker, {})
             
@@ -981,7 +1034,6 @@ def page_portfolio():
                 
                 st.markdown("---")
         
-        # Modal de venta
         if hasattr(st.session_state, 'selling_ticker') and st.session_state.selling_ticker:
             ticker = st.session_state.selling_ticker
             pos = st.session_state.selling_pos
@@ -1033,7 +1085,6 @@ def page_etfs():
     
     st.subheader("📚 Base de Datos de ETFs")
     
-    # Buscador
     st.markdown("### 🔍 Buscar y Añadir ETF")
     search = st.text_input("Buscar en Yahoo Finance (ticker o nombre)", key="etf_search")
     
@@ -1053,7 +1104,6 @@ def page_etfs():
                     st.caption(f"{result['type']} - {result['exchange']}")
                 
                 with col3:
-                    # Obtener precio
                     if st.button("Ver", key=f"view_{result['symbol']}"):
                         quote = get_quote(result['symbol'])
                         if quote and quote.get('success'):
@@ -1074,7 +1124,6 @@ def page_etfs():
                             st.success(f"✅ {result['symbol']} añadido")
                             st.rerun()
                 
-                # Mostrar quote si existe
                 if f"quote_{result['symbol']}" in st.session_state:
                     q = st.session_state[f"quote_{result['symbol']}"]
                     st.info(f"💰 {q['price']:.2f} {q['currency']} | Cambio: {q.get('change_pct', 0):+.2f}%")
@@ -1084,7 +1133,6 @@ def page_etfs():
     
     st.markdown("---")
     
-    # Actualizar todos
     col1, col2 = st.columns([1, 4])
     with col1:
         if st.button("🔄 Actualizar Todos"):
@@ -1106,11 +1154,9 @@ def page_etfs():
             st.success("✅ Todos actualizados")
             st.rerun()
     
-    # Tabla de ETFs
     st.markdown("### 📋 ETFs Guardados")
     
     if data['etfs']:
-        # Crear lista de tickers para poder eliminar sin errores
         tickers_list = list(data['etfs'].keys())
         etf_to_delete = None
         
@@ -1142,7 +1188,6 @@ def page_etfs():
                 if st.button("🗑️", key=f"delete_etf_{ticker}"):
                     etf_to_delete = ticker
         
-        # Eliminar ETF si se marcó
         if etf_to_delete is not None:
             del data['etfs'][etf_to_delete]
             save_data(data)
@@ -1156,43 +1201,61 @@ def page_settings():
     
     st.subheader("⚙️ Configuración")
     
-    # Capital y liquidez
-    col1, col2 = st.columns(2)
+    # Capital y liquidez editables
+    st.markdown("### 💰 Capital y Reserva")
+    
+    col1, col2, col3 = st.columns(3)
     
     with col1:
         new_capital = st.number_input(
             "Capital Total (€)",
             min_value=1000,
             value=data['settings']['capital'],
-            step=1000
+            step=500,
+            help="Capital total de la cartera"
         )
-        
-        if new_capital != data['settings']['capital']:
-            data['settings']['capital'] = new_capital
-            save_data(data)
-            st.success("✅ Capital actualizado")
     
     with col2:
-        st.metric("Reserva de Liquidez", f"{RESERVE_LIQUIDITY} €")
-        st.metric("Capital Efectivo", f"{new_capital - RESERVE_LIQUIDITY:,.0f} €")
+        current_reserve = data['settings'].get('reserve', 500)
+        new_reserve = st.number_input(
+            "Reserva de Liquidez (€)",
+            min_value=0,
+            max_value=new_capital - 1000,
+            value=current_reserve,
+            step=100,
+            help="Cantidad reservada que no se usará para inversiones"
+        )
     
-    st.info(f"ℹ️ Se reservan siempre {RESERVE_LIQUIDITY}€ de liquidez para evitar problemas de ejecución. Los cálculos de asignación se realizan sobre el capital efectivo ({new_capital - RESERVE_LIQUIDITY:,.0f}€).")
+    with col3:
+        effective = new_capital - new_reserve
+        st.metric("Capital Efectivo", f"{effective:,.0f} €")
+    
+    # Guardar cambios si hay modificaciones
+    if new_capital != data['settings']['capital'] or new_reserve != current_reserve:
+        if st.button("💾 Guardar Configuración de Capital", type="primary"):
+            data['settings']['capital'] = new_capital
+            data['settings']['reserve'] = new_reserve
+            save_data(data)
+            st.success("✅ Configuración actualizada")
+            st.rerun()
+    
+    st.info(f"ℹ️ Se reservan {new_reserve}€ de liquidez para evitar problemas de ejecución. Los cálculos de asignación se realizan sobre el capital efectivo ({effective:,.0f}€).")
     
     st.markdown("---")
     
     # Comisión por defecto
-    st.subheader("💸 Comisión por Defecto")
+    st.markdown("### 💸 Comisión por Defecto")
     st.info(f"La comisión por defecto es de **{DEFAULT_COMMISSION_USD} USD** por orden, que se convierte automáticamente a EUR según el tipo de cambio del día de la orden.")
     
     st.markdown("---")
     
     # Snapshot
-    st.subheader("📸 Gestión de Snapshots")
+    st.markdown("### 📸 Gestión de Snapshots")
     
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
-        if st.button("📸 Guardar Snapshot Ahora"):
+        if st.button("📸 Guardar Snapshot Ahora", use_container_width=True):
             positions = calculate_positions(data)
             stats = calculate_stats(data, positions)
             
@@ -1204,18 +1267,30 @@ def page_settings():
             })
             save_data(data)
             st.success("✅ Snapshot guardado")
+            st.rerun()
     
     with col2:
-        if st.button("🗑️ Borrar Todos los Snapshots"):
+        st.metric("Snapshots guardados", len(data['snapshots']))
+    
+    with col3:
+        if st.button("🗑️ Borrar Todos los Snapshots", use_container_width=True):
             data['snapshots'] = []
             save_data(data)
             st.success("Snapshots borrados")
             st.rerun()
     
+    # Mostrar historial de snapshots
+    if data['snapshots']:
+        with st.expander("📋 Ver Historial de Snapshots"):
+            snapshots_df = pd.DataFrame(data['snapshots'])
+            snapshots_df['date'] = pd.to_datetime(snapshots_df['date']).dt.strftime('%Y-%m-%d %H:%M')
+            snapshots_df.columns = ['Fecha', 'Valor Total', 'Invertido', 'P&L']
+            st.dataframe(snapshots_df, use_container_width=True, hide_index=True)
+    
     st.markdown("---")
     
     # Export/Import
-    st.subheader("💾 Exportar / Importar Datos")
+    st.markdown("### 💾 Exportar / Importar Datos")
     
     col1, col2 = st.columns(2)
     
@@ -1224,7 +1299,8 @@ def page_settings():
             label="📥 Descargar Backup (JSON)",
             data=json.dumps(data, indent=2, default=str),
             file_name=f"portfolio_backup_{datetime.now().strftime('%Y%m%d')}.json",
-            mime="application/json"
+            mime="application/json",
+            use_container_width=True
         )
     
     with col2:
@@ -1232,6 +1308,9 @@ def page_settings():
         if uploaded:
             try:
                 imported = json.load(uploaded)
+                # Asegurar compatibilidad
+                if 'reserve' not in imported.get('settings', {}):
+                    imported['settings']['reserve'] = 500
                 st.session_state.data = imported
                 save_data(imported)
                 st.success("✅ Datos importados")
@@ -1242,20 +1321,34 @@ def page_settings():
     st.markdown("---")
     
     # Reset
-    st.subheader("⚠️ Zona de Peligro")
+    st.markdown("### ⚠️ Zona de Peligro")
     
-    if st.button("🗑️ Borrar TODOS los Datos", type="secondary"):
-        if st.checkbox("Confirmo que quiero borrar todo"):
-            st.session_state.data = {
-                'settings': {'capital': 15000},
-                'etfs': {},
-                'signals': {},
-                'orders': [],
-                'snapshots': []
-            }
-            save_data(st.session_state.data)
-            st.success("Datos borrados")
-            st.rerun()
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("🗑️ Borrar TODOS los Datos", type="secondary", use_container_width=True):
+            st.session_state.confirm_delete = True
+    
+    if st.session_state.get('confirm_delete', False):
+        st.warning("⚠️ Esta acción eliminará todos los datos. ¿Estás seguro?")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Sí, borrar todo", type="primary"):
+                st.session_state.data = {
+                    'settings': {'capital': 15000, 'reserve': 500},
+                    'etfs': {},
+                    'signals': {},
+                    'orders': [],
+                    'snapshots': []
+                }
+                save_data(st.session_state.data)
+                st.session_state.confirm_delete = False
+                st.success("Datos borrados")
+                st.rerun()
+        with col2:
+            if st.button("❌ Cancelar"):
+                st.session_state.confirm_delete = False
+                st.rerun()
 
 # ============================================
 # MAIN
@@ -1263,7 +1356,6 @@ def page_settings():
 def main():
     render_header()
     
-    # Navegación
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📊 Dashboard",
         "📈 Señales",
