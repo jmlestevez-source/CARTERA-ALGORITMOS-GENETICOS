@@ -65,6 +65,15 @@ SYSTEMS = ['CEG', 'DGSE', 'DDG', 'EIR', 'Colossus']
 DATA_FILE = 'portfolio_data.json'
 DEFAULT_COMMISSION_USD = 2.0
 
+# Colores para sistemas
+SYSTEM_COLORS = {
+    'CEG': '#0ea5e9',      # Azul
+    'DGSE': '#10b981',     # Verde
+    'DDG': '#f59e0b',      # Naranja
+    'EIR': '#8b5cf6',      # Púrpura
+    'Colossus': '#ef4444'  # Rojo
+}
+
 BENCHMARKS = {
     'SPY': 'S&P 500 (USD)',
     'IWDA.L': 'MSCI World (EUR)',
@@ -248,57 +257,40 @@ def get_total_capital_with_contributions(data: dict) -> float:
     return base_capital + total_contributions
 
 def get_systems_for_ticker(data: dict, ticker: str) -> list:
-    """Obtiene los sistemas asignados a un ticker desde las señales guardadas del mes actual"""
+    """Obtiene los sistemas asignados a un ticker desde las señales guardadas"""
     now = datetime.now()
-    key = f"{now.year}-{now.month}"
     
-    # Buscar en señales del mes actual
-    signals = data['signals'].get(key, {})
-    systems = []
+    # Buscar en señales del mes actual y anteriores
+    for month_offset in range(0, 13):
+        check_month = now.month - month_offset
+        check_year = now.year
+        while check_month <= 0:
+            check_month += 12
+            check_year -= 1
+        
+        key = f"{check_year}-{check_month}"
+        signals = data['signals'].get(key, {})
+        systems = []
+        
+        for system in SYSTEMS:
+            sys_signals = signals.get(system, {'buy': [], 'hold': [], 'sell': []})
+            active_etfs = sys_signals.get('buy', []) + sys_signals.get('hold', [])
+            if ticker in active_etfs:
+                systems.append(system)
+        
+        if systems:
+            return systems
     
-    for system in SYSTEMS:
-        sys_signals = signals.get(system, {'buy': [], 'hold': [], 'sell': []})
-        active_etfs = sys_signals.get('buy', []) + sys_signals.get('hold', [])
-        if ticker in active_etfs:
-            systems.append(system)
-    
-    # Si no se encuentra en el mes actual, buscar en meses anteriores
-    if not systems:
-        for month_offset in range(1, 13):
-            check_month = now.month - month_offset
-            check_year = now.year
-            if check_month <= 0:
-                check_month += 12
-                check_year -= 1
-            
-            key = f"{check_year}-{check_month}"
-            signals = data['signals'].get(key, {})
-            
-            for system in SYSTEMS:
-                sys_signals = signals.get(system, {'buy': [], 'hold': [], 'sell': []})
-                active_etfs = sys_signals.get('buy', []) + sys_signals.get('hold', [])
-                if ticker in active_etfs:
-                    systems.append(system)
-            
-            if systems:
-                break
-    
-    return systems
+    return []
 
 def get_current_allocation(data: dict) -> dict:
     """Obtiene la asignación del mes actual o la más reciente"""
     now = datetime.now()
-    key = f"{now.year}-{now.month}"
     
-    # Buscar asignación del mes actual
-    if key in data['allocations']:
-        return data['allocations'][key].get('allocation', {})
-    
-    # Buscar en meses anteriores
-    for month_offset in range(1, 13):
+    for month_offset in range(0, 13):
         check_month = now.month - month_offset
         check_year = now.year
-        if check_month <= 0:
+        while check_month <= 0:
             check_month += 12
             check_year -= 1
         
@@ -320,7 +312,6 @@ def calculate_positions(data: dict) -> dict:
     for order in sorted_orders:
         ticker = order['ticker']
         if ticker not in positions:
-            # Obtener sistemas desde las señales guardadas
             systems_from_signals = get_systems_for_ticker(data, ticker)
             
             positions[ticker] = {
@@ -332,7 +323,7 @@ def calculate_positions(data: dict) -> dict:
                 'market_value': 0,
                 'pnl': 0,
                 'pnl_pct': 0,
-                'systems': systems_from_signals  # Usar sistemas de señales
+                'systems': systems_from_signals
             }
         
         pos = positions[ticker]
@@ -342,7 +333,6 @@ def calculate_positions(data: dict) -> dict:
             pos['total_cost'] += order['total'] + commission
             pos['total_commission'] += commission
             pos['units'] += order['units']
-            # También añadir sistemas de la orden si los tiene
             if order.get('system'):
                 for s in order['system'].split(', '):
                     if s and s not in pos['systems']:
@@ -378,44 +368,63 @@ def calculate_positions(data: dict) -> dict:
     
     return positions
 
-def calculate_system_distribution(data: dict, positions: dict) -> dict:
-    """Calcula la distribución por sistema basándose en las señales guardadas"""
+def calculate_weight_comparison(data: dict, positions: dict, stats: dict) -> pd.DataFrame:
+    """Calcula la comparación de pesos objetivo vs actual para cada ETF"""
     current_allocation = get_current_allocation(data)
+    total_portfolio_value = stats['total_value']
     
-    system_values = {s: 0 for s in SYSTEMS}
+    comparison_data = []
     
-    if current_allocation:
-        # Usar la asignación guardada para calcular pesos
-        total_weight = sum(item.get('weight', 0) for item in current_allocation.values())
+    # Combinar ETFs de posiciones y asignación
+    all_tickers = set(positions.keys()) | set(current_allocation.keys())
+    
+    for ticker in all_tickers:
+        pos = positions.get(ticker, {})
+        alloc = current_allocation.get(ticker, {})
         
-        for ticker, pos in positions.items():
-            if ticker in current_allocation:
-                alloc_item = current_allocation[ticker]
-                systems = alloc_item.get('systems', [])
-                
-                if systems:
-                    # Distribuir el valor de mercado entre los sistemas asignados
-                    value_per_system = pos['market_value'] / len(systems)
-                    for sys in systems:
-                        if sys in system_values:
-                            system_values[sys] += value_per_system
-            else:
-                # Si el ticker no está en la asignación, usar los sistemas de la posición
-                if pos['systems']:
-                    value_per_system = pos['market_value'] / len(pos['systems'])
-                    for sys in pos['systems']:
-                        if sys in system_values:
-                            system_values[sys] += value_per_system
-    else:
-        # Fallback: usar los sistemas de las posiciones
-        for pos in positions.values():
-            if pos['systems']:
-                value_per_system = pos['market_value'] / len(pos['systems'])
-                for sys in pos['systems']:
-                    if sys in system_values:
-                        system_values[sys] += value_per_system
+        # Peso objetivo (de la asignación)
+        target_weight = alloc.get('weight', 0)
+        
+        # Peso actual (del valor de mercado)
+        current_value = pos.get('market_value', 0)
+        current_weight = (current_value / total_portfolio_value * 100) if total_portfolio_value > 0 else 0
+        
+        # Sistemas
+        systems = alloc.get('systems', []) or pos.get('systems', [])
+        
+        # Diferencia
+        weight_diff = current_weight - target_weight
+        
+        # Nombre
+        etf_info = data['etfs'].get(ticker, {})
+        name = etf_info.get('name', ticker)[:30]
+        
+        # Unidades objetivo vs actual
+        target_units = alloc.get('total_units', 0)
+        current_units = pos.get('units', 0)
+        
+        # Valor
+        target_value = alloc.get('total_capital', 0)
+        
+        comparison_data.append({
+            'ticker': ticker,
+            'name': name,
+            'systems': systems,
+            'target_weight': target_weight,
+            'current_weight': current_weight,
+            'weight_diff': weight_diff,
+            'target_units': target_units,
+            'current_units': current_units,
+            'target_value': target_value,
+            'current_value': current_value,
+            'status': 'over' if weight_diff > 0.5 else ('under' if weight_diff < -0.5 else 'ok')
+        })
     
-    return system_values
+    df = pd.DataFrame(comparison_data)
+    if not df.empty:
+        df = df.sort_values('target_weight', ascending=True)
+    
+    return df
 
 def calculate_portfolio_history(data: dict) -> pd.DataFrame:
     if not data['orders']:
@@ -881,6 +890,84 @@ def render_header():
         reserve = get_reserve(data)
         st.metric("Capital Efectivo", f"{effective:,.0f} €", f"-{reserve:.0f}€ reserva")
 
+def render_weight_comparison_chart(comparison_df: pd.DataFrame):
+    """Renderiza el gráfico de barras comparativo de pesos"""
+    if comparison_df.empty:
+        st.info("No hay datos de asignación para mostrar.")
+        return
+    
+    fig = go.Figure()
+    
+    # Barra de peso objetivo (fondo)
+    fig.add_trace(go.Bar(
+        y=comparison_df['ticker'],
+        x=comparison_df['target_weight'],
+        name='Peso Objetivo',
+        orientation='h',
+        marker=dict(
+            color='rgba(100, 116, 139, 0.4)',
+            line=dict(color='rgba(100, 116, 139, 0.8)', width=1)
+        ),
+        text=[f"{w:.1f}%" for w in comparison_df['target_weight']],
+        textposition='inside',
+        insidetextanchor='start',
+        hovertemplate='<b>%{y}</b><br>Objetivo: %{x:.2f}%<extra></extra>'
+    ))
+    
+    # Barra de peso actual (sobrepuesta)
+    colors = []
+    for _, row in comparison_df.iterrows():
+        if row['status'] == 'over':
+            colors.append('#10b981')  # Verde - sobreponderado
+        elif row['status'] == 'under':
+            colors.append('#ef4444')  # Rojo - infraponderado
+        else:
+            colors.append('#0ea5e9')  # Azul - en objetivo
+    
+    fig.add_trace(go.Bar(
+        y=comparison_df['ticker'],
+        x=comparison_df['current_weight'],
+        name='Peso Actual',
+        orientation='h',
+        marker=dict(
+            color=colors,
+            line=dict(color='rgba(0,0,0,0.3)', width=1)
+        ),
+        text=[f"{w:.1f}%" for w in comparison_df['current_weight']],
+        textposition='outside',
+        hovertemplate='<b>%{y}</b><br>Actual: %{x:.2f}%<extra></extra>'
+    ))
+    
+    fig.update_layout(
+        barmode='overlay',
+        height=max(300, len(comparison_df) * 45),
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        font_color='#64748b',
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        ),
+        xaxis=dict(
+            title='Peso (%)',
+            showgrid=True,
+            gridwidth=1,
+            gridcolor='rgba(148,163,184,0.2)',
+            range=[0, max(comparison_df['target_weight'].max(), comparison_df['current_weight'].max()) * 1.3]
+        ),
+        yaxis=dict(
+            title='',
+            showgrid=False
+        ),
+        margin=dict(l=10, r=10, t=30, b=10)
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+
 # ============================================
 # PÁGINAS
 # ============================================
@@ -1129,42 +1216,46 @@ def page_dashboard():
             st.plotly_chart(fig, use_container_width=True)
         
         with col2:
-            st.subheader("🎯 Distribución por Sistema")
+            st.subheader("🎯 Peso Objetivo vs Peso Actual")
             
-            if positions:
-                # Usar la nueva función que calcula desde las señales
-                system_values = calculate_system_distribution(data, positions)
+            # Calcular comparación de pesos
+            comparison_df = calculate_weight_comparison(data, positions, stats)
+            
+            if not comparison_df.empty:
+                # Mostrar gráfico de barras
+                render_weight_comparison_chart(comparison_df)
                 
-                # Filtrar sistemas con valor
-                system_values = {k: v for k, v in system_values.items() if v > 0}
+                # Leyenda
+                st.markdown("""
+                    <small>
+                    🟢 <b>Verde</b>: Sobreponderado (>0.5% sobre objetivo) | 
+                    🔴 <b>Rojo</b>: Infraponderado (<0.5% bajo objetivo) | 
+                    🔵 <b>Azul</b>: En objetivo (±0.5%)
+                    </small>
+                """, unsafe_allow_html=True)
                 
-                if system_values:
-                    fig = px.pie(
-                        values=list(system_values.values()),
-                        names=list(system_values.keys()),
-                        hole=0.6,
-                        color_discrete_sequence=['#0ea5e9', '#10b981', '#f59e0b', '#8b5cf6', '#ef4444']
-                    )
-                    fig.update_layout(
-                        height=300,
-                        plot_bgcolor='rgba(0,0,0,0)',
-                        paper_bgcolor='rgba(0,0,0,0)',
-                        font_color='#94a3b8',
-                        showlegend=True,
-                        legend=dict(orientation="h", yanchor="bottom", y=-0.2)
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Mostrar tabla de distribución
-                    st.markdown("**Detalle por sistema:**")
-                    total_value = sum(system_values.values())
-                    for sys, value in sorted(system_values.items(), key=lambda x: -x[1]):
-                        pct = (value / total_value * 100) if total_value > 0 else 0
-                        st.caption(f"{sys}: {value:,.2f}€ ({pct:.1f}%)")
-                else:
-                    st.warning("⚠️ No hay señales guardadas para asignar sistemas a las posiciones. Ve a 'Señales' y guarda las señales del mes.")
+                # Tabla detallada
+                with st.expander("📋 Ver detalle por ETF"):
+                    for _, row in comparison_df.iterrows():
+                        systems_str = ', '.join(row['systems']) if row['systems'] else 'Sin asignar'
+                        status_emoji = "🟢" if row['status'] == 'over' else ("🔴" if row['status'] == 'under' else "🔵")
+                        diff_str = f"{row['weight_diff']:+.2f}%"
+                        
+                        col1, col2, col3, col4 = st.columns([2, 1.5, 1.5, 1])
+                        with col1:
+                            st.markdown(f"**{row['ticker']}**")
+                            st.caption(f"📌 {systems_str}")
+                        with col2:
+                            st.caption("Objetivo")
+                            st.write(f"{row['target_weight']:.1f}% ({row['target_units']} uds)")
+                        with col3:
+                            st.caption("Actual")
+                            st.write(f"{row['current_weight']:.1f}% ({row['current_units']} uds)")
+                        with col4:
+                            st.caption("Diff")
+                            st.write(f"{status_emoji} {diff_str}")
             else:
-                st.info("No hay posiciones para mostrar.")
+                st.warning("⚠️ No hay asignación guardada. Ve a 'Señales' y guarda las señales del mes.")
     else:
         st.info("No hay órdenes registradas. Registra órdenes para ver la evolución del portfolio.")
     
@@ -1181,13 +1272,13 @@ def page_dashboard():
             pos_data.append({
                 'Ticker': ticker,
                 'Nombre': etf_info.get('name', ticker)[:40],
+                'Sistemas': systems_str,
                 'Unidades': pos['units'],
                 'P. Medio': f"{pos['avg_price']:.2f} €",
                 'P. Actual': f"{pos['current_price']:.2f} €",
                 'Valor': f"{pos['market_value']:.2f} €",
                 'P&L': f"{pnl_emoji} {pos['pnl']:+.2f} €",
-                'P&L %': f"{pnl_emoji} {pos['pnl_pct']:+.2f}%",
-                'Sistemas': systems_str
+                'P&L %': f"{pnl_emoji} {pos['pnl_pct']:+.2f}%"
             })
         
         df = pd.DataFrame(pos_data)
@@ -1268,6 +1359,7 @@ def page_signals():
                 system = SYSTEMS[i + j]
                 
                 with col:
+                    color = SYSTEM_COLORS.get(system, '#6366f1')
                     st.markdown(f"### 🎯 {system}")
                     
                     sys_signals = data['signals'][key].get(system, {'buy': [], 'hold': [], 'sell': []})
@@ -1377,14 +1469,15 @@ def page_allocation():
         
         alloc_data = []
         for ticker, item in allocation.items():
+            systems_badges = ' '.join([f"**{s}**" for s in item['systems']])
             alloc_data.append({
                 'Ticker': ticker,
                 'Nombre': item['name'][:35] if item['name'] else ticker,
+                'Sistemas': ', '.join(item['systems']),
                 'Capital': f"{item['total_capital']:,.2f} €",
                 'Precio': f"{item['price_eur']:.2f} €",
                 'Unidades': item['total_units'],
                 'Peso': f"{item['weight']:.1f}%",
-                'Sistemas': ', '.join(item['systems']),
                 'Moneda': item['currency']
             })
         
@@ -1399,7 +1492,8 @@ def page_allocation():
                 col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 1, 1])
                 
                 with col1:
-                    st.write(f"**{ticker}** - {item['name'][:25]}")
+                    st.write(f"**{ticker}**")
+                    st.caption(f"📌 {', '.join(item['systems'])}")
                 
                 with col2:
                     st.write(f"{item['total_units']} uds")
@@ -1736,7 +1830,7 @@ def page_portfolio():
                 
                 with col1:
                     st.write(f"**{ticker}**")
-                    st.caption(f"{etf_info.get('name', '')[:25]} | {systems_str}")
+                    st.caption(f"📌 {systems_str}")
                 
                 with col2:
                     st.metric("Unidades", pos['units'])
